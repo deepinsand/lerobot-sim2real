@@ -20,7 +20,7 @@ def main(args: Args):
     env_kwargs = dict(
         obs_mode="rgb+segmentation",
         render_mode="sensors",
-        domain_randomization=False,
+        domain_randomization=True,
         reward_mode="none",
         # note this changes the sim camera resolution to 512x512, but this is just for development/debugging. During training
         # we will not use such large images
@@ -29,6 +29,7 @@ def main(args: Args):
     if args.env_kwargs_json_path is not None:
         with open(args.env_kwargs_json_path, "r") as f:
             env_kwargs.update(json.load(f))
+
     env = gym.make(args.env_id, **env_kwargs)
     if args.record_dir is not None:
         env = RecordEpisode(env, output_dir=args.record_dir, save_video=False, save_trajectory=False, video_fps=15)

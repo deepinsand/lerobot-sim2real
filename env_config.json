@@ -6,5 +6,8 @@
   },
   "greenscreen_overlay_path": "greenscreen.png",
   "spawn_box_pos": [0.3, 0.05],
-  "spawn_box_half_size": 0.1
+  "spawn_box_half_size": 0.1,
+  "domain_randomization_config": {
+    "robot_color": [1, 1, 1]
+  }
 }
