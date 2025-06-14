@@ -9,7 +9,7 @@ setup(
     python_requires=">=3.9",
     setup_requires=["setuptools>=62.3.0"],
     install_requires=[
-        "mani-skill @ git+https://github.com/deepinsand/ManiSkill.git#egg=mani-skill",
+        "mani_skill_nightly",
         "tensorboard",
         "wandb"
     ]
