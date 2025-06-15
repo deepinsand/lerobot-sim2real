@@ -51,7 +51,7 @@ class SO100AvoidCylinderDomainRandomizationConfig:
 
     ### Cylinder specific randomizations (new obstacle) ###
     cylinder_radius_range: Sequence[float] = (0.015, 0.025) # meters, for capsule
-    cylinder_half_length_range: Sequence[float] = (0.08, 0.12) # meters, for capsule half_length
+    cylinder_half_length_range: Sequence[float] = (0.04, 0.06) # meters, for capsule half_length
     cylinder_friction_mean: float = 0.3
     cylinder_friction_std: float = 0.05
     cylinder_friction_bounds: Sequence[float] = (0.1, 0.5)
