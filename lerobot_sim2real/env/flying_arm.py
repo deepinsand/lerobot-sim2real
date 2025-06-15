@@ -25,7 +25,7 @@ from mani_skill.utils.structs.types import GPUMemoryConfig, SimConfig
 @dataclass
 class SO100AvoidCylinderDomainRandomizationConfig:
     ### task agnostic domain randomizations, many of which you can copy over to your own tasks ###
-    initial_qpos_noise_scale: float = 0.02
+    initial_qpos_noise_scale: float = 0.2  # Increased from 0.02 for more varied starts
     robot_color: Optional[Union[str, Sequence[float]]] = None
     """Color of the robot in RGB format in scale of 0 to 1 mapping to 0 to 255.
     If you want to randomize it just set this value to "random". If left as None which is
@@ -48,6 +48,8 @@ class SO100AvoidCylinderDomainRandomizationConfig:
     cylinder_workspace_min: Tuple[float, float, float] = (0.1, -0.3, 0.05) # x, y, z
     cylinder_workspace_max: Tuple[float, float, float] = (0.5, 0.3, 0.4)  # x, y, z
     randomize_cylinder_orientation: bool = False # For now, keep orientation fixed or simple
+    cylinder_velocity_update_prob: float = 0.05 # Probability per control step to change cylinder velocity
+
 
 
 @register_env("SO100AvoidCylinder-v1", max_episode_steps=256)
@@ -319,8 +321,10 @@ class SO100AvoidCylinderEnv(BaseDigitalTwinEnv):
             self.table_scene.table.set_pose(self.table_pose)
 
             # sample a random initial joint configuration for the robot
+            qpos_noise = torch.randn(size=(b, self.rest_qpos.shape[-1]), device=self.device) * \
+                         self.domain_randomization_config.initial_qpos_noise_scale
             self.agent.robot.set_qpos(
-                self.rest_qpos + torch.randn(size=(b, self.rest_qpos.shape[-1])) * 0.02
+                self.rest_qpos + qpos_noise
             )
             self.agent.robot.set_pose(
                 Pose.create_from_pq(p=[0, 0, 0], q=euler2quat(0, 0, np.pi / 2))
@@ -359,17 +363,37 @@ class SO100AvoidCylinderEnv(BaseDigitalTwinEnv):
         # Update cylinder pose based on its velocity
         dt = 1.0 / self.control_freq
         current_cylinder_pose = self.obstacle_cylinder.pose
+
+        # Probabilistically update cylinder velocity direction and speed
+        if self.domain_randomization and self.domain_randomization_config.cylinder_velocity_update_prob > 0:
+            update_mask = torch.rand(self.num_envs, device=self.device) < self.domain_randomization_config.cylinder_velocity_update_prob
+            if torch.any(update_mask):
+                num_to_update = update_mask.sum()
+                
+                new_speeds = (torch.rand(num_to_update, device=self.device) *
+                              (self.domain_randomization_config.cylinder_speed_range[1] - self.domain_randomization_config.cylinder_speed_range[0]) +
+                              self.domain_randomization_config.cylinder_speed_range[0])
+                
+                new_directions = torch.randn(num_to_update, 3, device=self.device)
+                new_directions = new_directions / torch.linalg.norm(new_directions, dim=1, keepdim=True)
+                
+                self.obstacle_cylinder_velocity[update_mask] = new_directions * new_speeds.unsqueeze(1)
+
         new_pos = current_cylinder_pose.p + self.obstacle_cylinder_velocity * dt
-        
-        # Optional: Keep cylinder within workspace (e.g. by reflecting velocity at boundaries)
-        # For now, let it move freely. Can be refined later.
-        # Example boundary check:
-        # for i in range(3):
-        #     hit_min = new_pos[:, i] < self.cylinder_ws_min[i]
-        #     hit_max = new_pos[:, i] > self.cylinder_ws_max[i]
-        #     self.obstacle_cylinder_velocity[hit_min, i] *= -1
-        #     self.obstacle_cylinder_velocity[hit_max, i] *= -1
-        # new_pos = torch.clamp(new_pos, self.cylinder_ws_min, self.cylinder_ws_max)
+
+        # Cylinder boundary reflection
+        for i in range(3):  # x, y, z axes
+            # Min boundary
+            hit_min = new_pos[:, i] < self.cylinder_ws_min[i]
+            new_pos[hit_min, i] = self.cylinder_ws_min[i] + (self.cylinder_ws_min[i] - new_pos[hit_min, i])
+            self.obstacle_cylinder_velocity[hit_min, i] *= -1
+            
+            # Max boundary
+            hit_max = new_pos[:, i] > self.cylinder_ws_max[i]
+            new_pos[hit_max, i] = self.cylinder_ws_max[i] - (new_pos[hit_max, i] - self.cylinder_ws_max[i])
+            self.obstacle_cylinder_velocity[hit_max, i] *= -1
+        # Clamp to ensure it stays strictly within bounds after potential multiple reflections/large dt
+        new_pos = torch.max(torch.min(new_pos, self.cylinder_ws_max.unsqueeze(0)), self.cylinder_ws_min.unsqueeze(0))
 
         self.obstacle_cylinder.set_pose(Pose.create_from_pq(p=new_pos, q=current_cylinder_pose.q))
 
@@ -458,20 +482,17 @@ class SO100AvoidCylinderEnv(BaseDigitalTwinEnv):
         }
 
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: Dict):
-        # Positive reward for surviving each step
-        survival_bonus = 0.1
 
         # Reward for keeping distance from the cylinder
-        distance_reward = torch.tanh(info["dist_tcp_to_cylinder"]) # Bounded reward, increases with distance
-
-        reward = survival_bonus + distance_reward
+        distance_reward = torch.tanh(info["dist_tcp_to_cylinder"]) # Max 1?
+        reward = distance_reward
 
         # Optional: Penalty for touching the table
         table_penalty_value = 0.5
         reward -= table_penalty_value * info["touching_table"].float()
 
         # Large negative penalty for collision
-        collision_penalty_value = -10.0
+        collision_penalty_value = -1.0
         reward = torch.where(info["collided_with_obstacle"], torch.full_like(reward, collision_penalty_value), reward)
 
         return reward
@@ -481,19 +502,8 @@ class SO100AvoidCylinderEnv(BaseDigitalTwinEnv):
     ):
         raw_reward = self.compute_dense_reward(obs=obs, action=action, info=info)
 
-        # Normalize based on the potential range of non-collision rewards.
-        # Max positive reward per step: survival_bonus (0.1) + max_distance_reward (tanh approaches 1.0) = 1.1
-        # Min non-collision reward per step: survival_bonus (0.1) - table_penalty (0.5) = -0.4
-        # We scale by the max possible positive component.
-        max_expected_positive_reward_per_step = 0.1 + 1.0 # survival_bonus + max_tanh_dist
-
-        # Scale all rewards by this factor.
-        # Non-collision rewards will be roughly in:
-        # Max: (0.1 + 1.0) / 1.1 = 1.0
-        # Min: (0.1 - 0.5) / 1.1 = -0.4 / 1.1 approx -0.36
-        # Collision penalty becomes: -10.0 / 1.1 approx -9.09
-        normalized_reward = raw_reward / max_expected_positive_reward_per_step
-        return normalized_reward
+       
+        return raw_reward
 
     # Override compute_terminated to end episode on collision
     def compute_terminated(self, obs: Any, action: torch.Tensor, info: Dict[str, Any]) -> torch.Tensor:
