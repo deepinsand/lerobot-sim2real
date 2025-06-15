@@ -1,11 +1,12 @@
-from dataclasses import dataclass
-from typing import Any, Dict, Tuple, Optional, Union, Sequence
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, Optional, Sequence, Union
 
+import dacite
 import numpy as np
 import sapien
 import torch
-from transforms3d.euler import euler2quat
 from sapien.render import RenderBodyComponent
+from transforms3d.euler import euler2quat
 
 import mani_skill.envs.utils.randomization as randomization
 from mani_skill.agents.robots.so100.so_100 import SO100
@@ -25,15 +26,14 @@ from mani_skill.utils.structs.types import GPUMemoryConfig, SimConfig
 @dataclass
 class SO100AvoidCylinderDomainRandomizationConfig:
     ### task agnostic domain randomizations, many of which you can copy over to your own tasks ###
-    initial_qpos_noise_scale: float = 0.2  # Increased from 0.02 for more varied starts
+    initial_qpos_noise_scale: float = 0.02
     robot_color: Optional[Union[str, Sequence[float]]] = None
     """Color of the robot in RGB format in scale of 0 to 1 mapping to 0 to 255.
     If you want to randomize it just set this value to "random". If left as None which is
     the default, it will set the robot parts to white and motors to black. For more fine-grained choices on robot colors you need to modify
     mani_skill/assets/robots/so100/so100.urdf in the ManiSkill package."""
-    randomize_table_color: bool = False # Example: can add more specific randomizations
     randomize_lighting: bool = True
-    max_camera_offset: Tuple[float, float, float] = (0.025, 0.025, 0.025)
+    max_camera_offset: Sequence[float] = (0.025, 0.025, 0.025)
     """max camera offset from the base camera position in x, y, and z axes"""
     camera_target_noise: float = 1e-3
     """scale of noise added to the camera target position"""
@@ -42,34 +42,39 @@ class SO100AvoidCylinderDomainRandomizationConfig:
     camera_fov_noise: float = np.deg2rad(2)
     """scale of noise added to the camera fov"""
 
-    ### Cylinder specific randomizations ###
-    cylinder_speed_range: Tuple[float, float] = (0.05, 0.15) # m/s
-    # Define a volume for cylinder's initial position and movement target
-    cylinder_workspace_min: Tuple[float, float, float] = (0.1, -0.3, 0.05) # x, y, z
-    cylinder_workspace_max: Tuple[float, float, float] = (0.5, 0.3, 0.4)  # x, y, z
-    randomize_cylinder_orientation: bool = False # For now, keep orientation fixed or simple
-    cylinder_velocity_update_prob: float = 0.05 # Probability per control step to change cylinder velocity
+    ### task-specific related domain randomizations that occur during scene loading ###
+    cube_half_size_range: Sequence[float] = (0.022 / 2, 0.028 / 2)
+    cube_friction_mean: float = 0.3
+    cube_friction_std: float = 0.05
+    cube_friction_bounds: Sequence[float] = (0.1, 0.5)
+    randomize_cube_color: bool = True
+
+    ### Cylinder specific randomizations (new obstacle) ###
+    cylinder_radius_range: Sequence[float] = (0.015, 0.025) # meters, for capsule
+    cylinder_half_length_range: Sequence[float] = (0.08, 0.12) # meters, for capsule half_length
+    cylinder_friction_mean: float = 0.3
+    cylinder_friction_std: float = 0.05
+    cylinder_friction_bounds: Sequence[float] = (0.1, 0.5)
+    randomize_cylinder_color: bool = True
+    cylinder_spawn_box_center_xy: Sequence[float] = (0.3, -0.15) # (x,y) center for cylinder spawn area, relative to robot base
+    cylinder_spawn_box_half_widths_xy: Sequence[float] = (0.05, 0.05) # half-widths for cylinder spawn area (dx, dy)
+
+    def dict(self):
+        return {k: v for k, v in asdict(self).items()}
 
 
-
-@register_env("SO100AvoidCylinder-v1", max_episode_steps=256)
+@register_env("SO100AvoidCylinder-v1", max_episode_steps=64)
 class SO100AvoidCylinderEnv(BaseDigitalTwinEnv):
     """
     **Task Description:**
-    The objective is for the SO100 arm to avoid a white cylinder that moves randomly through the scene.
-    The episode ends if the robot collides with the cylinder.
+    A simple task where the objective is to grasp a cube with the SO100 arm and bring it up to a target rest pose.
 
     **Randomizations:**
-    - The cylinder's initial position is randomized within a defined workspace.
-    - The cylinder's movement direction and speed are randomized.
-    - Lighting, camera pose, and robot initial configuration are randomized.
+    - the cube's xy position is randomized on top of a table in a region of size [0.2, 0.2] x [-0.2, -0.2]. It is placed flat on the table
+    - the cube's z-axis rotation is randomized to a random angle
 
     **Success Conditions:**
-    - The robot successfully avoids collision with the cylinder for the duration of the episode.
-
-    **Rewards:**
-    - Dense reward proportional to the distance from the robot's TCP to the cylinder.
-    - Large negative penalty upon collision with the cylinder.
+    - the cube is lifted, grasped, and the robot returns to a rest pose above the surface of the table
     """
 
     # _sample_video_link = "https://github.com/haosulab/ManiSkill/raw/main/figures/environment_demos/PickCube-v1_rt.mp4"
@@ -83,23 +88,33 @@ class SO100AvoidCylinderEnv(BaseDigitalTwinEnv):
         robot_uids="so100",
         control_mode="pd_joint_target_delta_pos",
         greenscreen_overlay_path=None,
-        domain_randomization_config=SO100AvoidCylinderDomainRandomizationConfig(),
+        domain_randomization_config: Union[
+            SO100AvoidCylinderDomainRandomizationConfig, dict
+        ] = SO100AvoidCylinderDomainRandomizationConfig(),
         domain_randomization=True,
         base_camera_settings=dict(
             fov=52 * np.pi / 180,
             pos=[0.5, 0.3, 0.35],
             target=[0.3, 0.0, 0.1],
         ),
+        spawn_box_pos=[0.3, 0.05],
+        spawn_box_half_size=0.2 / 2,
         **kwargs,
     ):
         self.domain_randomization = domain_randomization
         """whether randomization is turned on or off."""
-        self.domain_randomization_config = domain_randomization_config
-        if not isinstance(self.domain_randomization_config, SO100AvoidCylinderDomainRandomizationConfig):
-            logger.warning(f"domain_randomization_config is not of type SO100AvoidCylinderDomainRandomizationConfig, got {type(domain_randomization_config)}")
-            if isinstance(domain_randomization_config, dict): # attempt to cast if it's a dict
-                self.domain_randomization_config = SO100AvoidCylinderDomainRandomizationConfig(**domain_randomization_config)
+        self.domain_randomization_config = SO100AvoidCylinderDomainRandomizationConfig()
         """domain randomization config"""
+        merged_domain_randomization_config = self.domain_randomization_config.dict()
+        if isinstance(domain_randomization_config, dict):
+            common.dict_merge(
+                merged_domain_randomization_config, domain_randomization_config
+            )
+            self.domain_randomization_config = dacite.from_dict(
+                data_class=SO100AvoidCylinderDomainRandomizationConfig,
+                data=domain_randomization_config,
+                config=dacite.Config(strict=True),
+            )
         self.base_camera_settings = base_camera_settings
         """what the camera fov, position and target are when domain randomization is off. DR is centered around these settings"""
 
@@ -113,10 +128,8 @@ class SO100AvoidCylinderEnv(BaseDigitalTwinEnv):
         else:
             self.rgb_overlay_paths = dict(base_camera=greenscreen_overlay_path)
 
-        # Cylinder properties (convert inches to meters)
-        self.cylinder_length = 6 * 0.0254  # meters
-        self.cylinder_radius = (1 / 2) * 0.0254  # meters
-
+        self.spawn_box_pos = spawn_box_pos
+        self.spawn_box_half_size = spawn_box_half_size
         super().__init__(
             *args, robot_uids=robot_uids, control_mode=control_mode, **kwargs
         )
@@ -167,24 +180,15 @@ class SO100AvoidCylinderEnv(BaseDigitalTwinEnv):
             and self.domain_randomization_config.robot_color == "random"
             else False,
         )
-        # Limit the base swivel joint (shoulder_pan, which is the first joint)
-        # self.agent.robot.active_joints is a list of sapien.Joint objects.
-        if self.agent.robot.active_joints: # Check if there are any active joints
-            base_swivel_joint = self.agent.robot.active_joints[0]
-
-            # Convert 45 degrees to radians
-            swivel_limit_rad = np.deg2rad(45)
-            
-            # sapien.Joint.set_limits expects a (1, 2) array for a 1-DOF joint: [[lower_limit, upper_limit]]
-            new_joint_limits = np.array([[-swivel_limit_rad, swivel_limit_rad]], dtype=np.float32)
-            
-            base_swivel_joint.set_limits(new_joint_limits)
-        else:
-            logger.warning("Robot has no active joints, cannot set joint limits for base swivel.")
 
     def _load_lighting(self, options: dict):
-        self.scene.set_ambient_light([0.3, 0.3, 0.3])
-
+        if self.domain_randomization:
+            if self.domain_randomization_config.randomize_lighting:
+                ambient_colors = self._batched_episode_rng.uniform(0.2, 0.5, size=(3,))
+                for i, scene in enumerate(self.scene.sub_scenes):
+                    scene.render_system.ambient_light = ambient_colors[i]
+        else:
+            self.scene.set_ambient_light([0.3, 0.3, 0.3])
         self.scene.add_directional_light(
             [1, 1, -1], [1, 1, 1], shadow=False, shadow_scale=5, shadow_map_size=2048
         )
@@ -196,64 +200,160 @@ class SO100AvoidCylinderEnv(BaseDigitalTwinEnv):
         self.table_scene = TableSceneBuilder(self)
         self.table_scene.build()
 
-        # Cylinder visual material (white)
-        cylinder_color = np.array([200 / 255., 180 / 255., 150 / 255., 1.0]) # RGBA
+        # some default values for cube geometry
+        half_sizes = (
+            np.ones(self.num_envs)
+            * (
+                self.domain_randomization_config.cube_half_size_range[1]
+                + self.domain_randomization_config.cube_half_size_range[0]
+            )
+            / 2
+        )
+        colors = np.zeros((self.num_envs, 3))
+        colors[:, 0] = 1
+        frictions = (
+            np.ones(self.num_envs) * self.domain_randomization_config.cube_friction_mean
+        )
 
-        # Build obstacle cylinder
+        # randomize cube sizes, colors, and frictions
+        if self.domain_randomization:
+            # note that we use self._batched_episode_rng instead of torch.rand or np.random as it ensures even with a different number of parallel
+            # environments the same seed leads to the same RNG, which is important for reproducibility as geometric changes here aren't saveable in environment state
+            half_sizes = self._batched_episode_rng.uniform(
+                low=self.domain_randomization_config.cube_half_size_range[0],
+                high=self.domain_randomization_config.cube_half_size_range[1],
+            )
+            if self.domain_randomization_config.randomize_cube_color:
+                colors = self._batched_episode_rng.uniform(low=0, high=1, size=(3,))
+            frictions = self._batched_episode_rng.normal(
+                self.domain_randomization_config.cube_friction_mean,
+                self.domain_randomization_config.cube_friction_std,
+            )
+            frictions = frictions.clip(
+                *self.domain_randomization_config.cube_friction_bounds
+            )
+
+        self.cube_half_sizes = common.to_tensor(half_sizes, device=self.device)
+        colors = np.concatenate([colors, np.ones((self.num_envs, 1))], axis=-1)
+
+        # build our cubes
+        cubes = []
+        for i in range(self.num_envs):
+            # create a different cube in each parallel environment
+            # using our randomized colors, frictions, and sizes
+            builder = self.scene.create_actor_builder()
+            friction = frictions[i]
+            material = sapien.pysapien.physx.PhysxMaterial(
+                static_friction=friction,
+                dynamic_friction=friction,
+                restitution=0,
+            )
+            builder.add_box_collision(
+                half_size=[half_sizes[i]] * 3, material=material, density=200  # 25
+            )
+            builder.add_box_visual(
+                half_size=[half_sizes[i]] * 3,
+                material=sapien.render.RenderMaterial(
+                    base_color=colors[i],
+                ),
+            )
+            builder.initial_pose = sapien.Pose(p=[0, 0, half_sizes[i]])
+            builder.set_scene_idxs([i])
+            cube = builder.build(name=f"cube-{i}")
+            cubes.append(cube)
+            self.remove_from_state_dict_registry(cube)
+
+        # since we are building many different cubes but simulating in parallel, we need to merge them into a single actor
+        # so we can access each different cube's information with a single object
+        self.cube = Actor.merge(cubes, name="cube")
+        self.add_to_state_dict_registry(self.cube)
+
+        # --- Add Cylinder Obstacle ---
+        cylinder_radii_val = (
+            np.ones(self.num_envs)
+            * (
+                self.domain_randomization_config.cylinder_radius_range[1]
+                + self.domain_randomization_config.cylinder_radius_range[0]
+            )
+            / 2
+        )
+        cylinder_half_lengths_val = (
+            np.ones(self.num_envs)
+            * (
+                self.domain_randomization_config.cylinder_half_length_range[1]
+                + self.domain_randomization_config.cylinder_half_length_range[0]
+            )
+            / 2
+        )
+        cylinder_colors_val = np.zeros((self.num_envs, 3)) # Default color (e.g. blue)
+        cylinder_colors_val[:, 2] = 1 
+        cylinder_frictions_val = (
+            np.ones(self.num_envs) * self.domain_randomization_config.cylinder_friction_mean
+        )
+
+        if self.domain_randomization:
+            cylinder_radii_val = self._batched_episode_rng.uniform(
+                low=self.domain_randomization_config.cylinder_radius_range[0],
+                high=self.domain_randomization_config.cylinder_radius_range[1],
+            )
+            cylinder_half_lengths_val = self._batched_episode_rng.uniform(
+                low=self.domain_randomization_config.cylinder_half_length_range[0],
+                high=self.domain_randomization_config.cylinder_half_length_range[1],
+            )
+            if self.domain_randomization_config.randomize_cylinder_color:
+                cylinder_colors_val = self._batched_episode_rng.uniform(low=0, high=1, size=(3,))
+            cylinder_frictions_val = self._batched_episode_rng.normal(
+                self.domain_randomization_config.cylinder_friction_mean,
+                self.domain_randomization_config.cylinder_friction_std,
+            )
+            cylinder_frictions_val = cylinder_frictions_val.clip(
+                *self.domain_randomization_config.cylinder_friction_bounds
+            )
+        
+        self.cylinder_radii = common.to_tensor(cylinder_radii_val, device=self.device)
+        self.cylinder_half_lengths = common.to_tensor(cylinder_half_lengths_val, device=self.device)
+        cylinder_colors_val = np.concatenate([cylinder_colors_val, np.ones((self.num_envs, 1))], axis=-1)
+
         cylinders = []
         for i in range(self.num_envs):
             builder = self.scene.create_actor_builder()
-            # Using a capsule to represent the cylinder for collision and visual
-            # SAPIEN uses half_length for capsules
-            builder.add_capsule_collision(radius=self.cylinder_radius, half_length=self.cylinder_length / 2)
+            friction = cylinder_frictions_val[i]
+            material = sapien.pysapien.physx.PhysxMaterial(
+                static_friction=friction,
+                dynamic_friction=friction,
+                restitution=0,
+            )
+            # Use a capsule for the cylinder, oriented along Z-axis
+            # Default capsule in SAPIEN builder is along X-axis. Rotate it to be Z-axis.
+            capsule_pose = sapien.Pose(q=euler2quat(np.pi / 2, 0, 0)) # Rotate Y by 90 deg if default is X, or X by 90 if default is Y
+            # After checking SAPIEN, add_capsule_collision default is along X. So rotate around Y by pi/2 to make it Z-up.
+            # Or rotate around X by pi/2 to make it Y-up, then rotate that actor.
+            # Let's set actor pose later. For builder, default orientation is fine, then set actor pose.
+            # The capsule visual/collision takes radius and half_length (of the cylindrical part)
+            builder.add_capsule_collision(
+                radius=self.cylinder_radii[i].item(), 
+                half_length=self.cylinder_half_lengths[i].item(), 
+                material=material, 
+                density=150 # Slightly less dense than cube
+            )
             builder.add_capsule_visual(
-                radius=self.cylinder_radius,
-                half_length=self.cylinder_length / 2,
-                material=sapien.render.RenderMaterial(
-                    base_color=cylinder_color,
-                ),
+                radius=self.cylinder_radii[i].item(),
+                half_length=self.cylinder_half_lengths[i].item(),
+                material=sapien.render.RenderMaterial(base_color=cylinder_colors_val[i]),
             )
-            # Initial pose will be set in _initialize_episode
-            builder.initial_pose = sapien.Pose(p=[0, 0, -10]) # Initially far away
+            builder.initial_pose = sapien.Pose(p=[0, 0, self.cylinder_half_lengths[i].item()]) # Initial z, will be properly set
             builder.set_scene_idxs([i])
-            # Cylinder is kinematic, its pose is set directly
-            cylinder = builder.build_kinematic(name=f"obstacle_cylinder-{i}")
-            cylinders.append(cylinder)
-            self.remove_from_state_dict_registry(cylinder)
+            cylinder_actor = builder.build_kinematic(name=f"cylinder-{i}")
+            cylinders.append(cylinder_actor)
+            self.remove_from_state_dict_registry(cylinder_actor)
 
-        self.obstacle_cylinder = Actor.merge(cylinders, name="obstacle_cylinder")
-        self.add_to_state_dict_registry(self.obstacle_cylinder)
+        self.cylinder = Actor.merge(cylinders, name="cylinder")
+        self.add_to_state_dict_registry(self.cylinder)
 
-        # Objects to keep in render (not greenscreened)
+        # we want to only keep the robot and the cube in the render, everything else is greenscreened.
         self.remove_object_from_greenscreen(self.agent.robot)
-        self.remove_object_from_greenscreen(self.obstacle_cylinder)
-        if self.domain_randomization and self.domain_randomization_config.randomize_table_color:
-            # Example: if table color is randomized, ensure it's not greenscreened if needed
-            pass
-        else:
-            # By default, table might be part of background for greenscreen
-            # If you want the table to always be visible, remove it from greenscreen
-            # self.remove_object_from_greenscreen(self.table_scene.table)
-            pass
-
-        # Define workspace for cylinder movement based on DR config
-        self.cylinder_ws_min = common.to_tensor(self.domain_randomization_config.cylinder_workspace_min, device=self.device)
-        self.cylinder_ws_max = common.to_tensor(self.domain_randomization_config.cylinder_workspace_max, device=self.device)
-
-        # Initialize obstacle_cylinder_velocity here, as num_envs and device are available
-        self.obstacle_cylinder_velocity = torch.zeros((self.num_envs, 3), device=self.device)
-
-        # Ensure DR config tensors are on the correct device
-        if self.domain_randomization:
-            self.base_camera_settings["pos"] = common.to_tensor(
-                self.base_camera_settings["pos"], device=self.device
-            )
-            self.base_camera_settings["target"] = common.to_tensor(
-                self.base_camera_settings["target"], device=self.device
-            )
-            self.domain_randomization_config.max_camera_offset = common.to_tensor(
-                self.domain_randomization_config.max_camera_offset, device=self.device
-            )
+        self.remove_object_from_greenscreen(self.cube)
+        self.remove_object_from_greenscreen(self.cylinder)
 
         # a hardcoded initial joint configuration for the robot to start from
         self.rest_qpos = torch.tensor(
@@ -299,12 +399,24 @@ class SO100AvoidCylinderEnv(BaseDigitalTwinEnv):
                                         )
                                         + [1]
                                     )
+
     def sample_camera_poses(self, n: int):
         # a custom function to sample random camera poses
         # the way this works is we first sample "eyes", which are the camera positions
         # then we use the noised_look_at function to sample the full camera poses given the sampled eyes
         # and a target position the camera is pointing at
         if self.domain_randomization:
+            # in case these haven't been moved to torch tensors on the environment device
+            self.base_camera_settings["pos"] = common.to_tensor(
+                self.base_camera_settings["pos"], device=self.device
+            )
+            self.base_camera_settings["target"] = common.to_tensor(
+                self.base_camera_settings["target"], device=self.device
+            )
+            self.domain_randomization_config.max_camera_offset = common.to_tensor(
+                self.domain_randomization_config.max_camera_offset, device=self.device
+            )
+
             eyes = randomization.camera.make_camera_rectangular_prism(
                 n,
                 scale=self.domain_randomization_config.max_camera_offset,
@@ -335,87 +447,59 @@ class SO100AvoidCylinderEnv(BaseDigitalTwinEnv):
             self.table_scene.table.set_pose(self.table_pose)
 
             # sample a random initial joint configuration for the robot
-            qpos_noise = torch.randn(size=(b, self.rest_qpos.shape[-1]), device=self.device) * \
-                         self.domain_randomization_config.initial_qpos_noise_scale
             self.agent.robot.set_qpos(
-                self.rest_qpos + qpos_noise
+                self.rest_qpos + torch.randn(size=(b, self.rest_qpos.shape[-1])) * 0.02
             )
             self.agent.robot.set_pose(
                 Pose.create_from_pq(p=[0, 0, 0], q=euler2quat(0, 0, np.pi / 2))
             )
 
-            # Initialize cylinder pose and velocity
-            initial_pos = torch.rand(b, 3, device=self.device) * (self.cylinder_ws_max - self.cylinder_ws_min) + self.cylinder_ws_min
-            
-            # Cylinder orientation (e.g., upright or along an axis)
-            # For simplicity, let's align its length along the z-axis by default (for capsule)
-            # Or make it random if configured
-            if self.domain_randomization and self.domain_randomization_config.randomize_cylinder_orientation:
-                qs = randomization.random_quaternions(b, lock_x=False, lock_y=False, device=self.device)
-            else:
-                # Default orientation (e.g. upright if capsule's half_length is along its local z)
-                # Or aligned with world X axis: euler2quat(0, np.pi/2, 0)
-                qs = torch.tensor([euler2quat(0, np.pi/2, 0, axes="rxyz")], device=self.device, dtype=torch.float32).repeat(b, 1)
+            # initialize the cube at a random position and rotation around the z-axis
+            # This 'cube_spawn_region_center_abs' is the absolute center of the spawn region for the cube
+            cube_spawn_region_center_abs = self.agent.robot.pose.p + torch.tensor(
+                [self.spawn_box_pos[0], self.spawn_box_pos[1], 0], device=self.device
+            )
+            xyz = torch.zeros((b, 3), device=self.device)
+            # Random offset within a square of side (2 * self.spawn_box_half_size)
+            xyz[:, :2] = (
+                torch.rand((b, 2), device=self.device) * self.spawn_box_half_size * 2
+                - self.spawn_box_half_size
+            )
+            xyz[:, :2] += cube_spawn_region_center_abs[env_idx, :2] # Add the absolute center
+            xyz[:, 2] = self.cube_half_sizes[env_idx]
+            qs = randomization.random_quaternions(b, lock_x=True, lock_y=True, device=self.device)
+            self.cube.set_pose(Pose.create_from_pq(xyz, qs))
 
-            self.obstacle_cylinder.set_pose(Pose.create_from_pq(p=initial_pos, q=qs))
+            # Initialize the cylinder at a random position on the table, standing upright
+            # Use the same spawn region definition as the cube
+            cylinder_spawn_region_center_abs = cube_spawn_region_center_abs # Reuse the calculated center for the cube
 
-            # Sample random velocity for the cylinder
-            rand_speeds = (torch.rand(b, device=self.device) *
-                           (self.domain_randomization_config.cylinder_speed_range[1] - self.domain_randomization_config.cylinder_speed_range[0]) +
-                           self.domain_randomization_config.cylinder_speed_range[0])
-            
-            # Random direction vector
-            rand_directions = torch.randn(b, 3, device=self.device)
-            rand_directions = rand_directions / torch.linalg.norm(rand_directions, dim=1, keepdim=True)
-            
-            self.obstacle_cylinder_velocity[env_idx] = rand_directions * rand_speeds.unsqueeze(1)
+            # The half-widths for the cylinder's spawn region (dx, dy)
+            # self.spawn_box_half_size is a scalar, used for both x and y half_widths to match cube's square region
+            cylinder_spawn_half_widths_xy = torch.full((2,), self.spawn_box_half_size, device=self.device)
+
+            cyl_xyz = torch.zeros((b, 3), device=self.device)
+            # Random offset for cylinder, using its own half_widths (derived from cube's scalar half_size)
+            cyl_xyz[:, :2] = (
+                torch.rand((b, 2), device=self.device) * cylinder_spawn_half_widths_xy * 2
+                - cylinder_spawn_half_widths_xy
+            )
+            cyl_xyz[:, :2] += cylinder_spawn_region_center_abs[env_idx, :2] # Add the absolute center
+            cyl_xyz[:, 2] = self.cylinder_half_lengths[env_idx] # Capsule center height when standing
+            # Upright orientation for capsule (length along Z-axis, SAPIEN default capsule is along X)
+            q_upright = euler2quat(0, np.pi / 2, 0) # Rotates X-axis to Z-axis
+            cyl_qs = torch.tensor(q_upright, device=self.device, dtype=torch.float32).repeat(b, 1) # Ensure dtype
+            self.cylinder.set_pose(Pose.create_from_pq(p=cyl_xyz, q=cyl_qs))
 
             # randomize the camera poses
             self.camera_mount.set_pose(self.sample_camera_poses(n=b))
 
     def _before_control_step(self):
-        # Update cylinder pose based on its velocity
-        dt = 1.0 / self.control_freq
-        current_cylinder_pose = self.obstacle_cylinder.pose
-
-        # Probabilistically update cylinder velocity direction and speed
-        if self.domain_randomization and self.domain_randomization_config.cylinder_velocity_update_prob > 0:
-            update_mask = torch.rand(self.num_envs, device=self.device) < self.domain_randomization_config.cylinder_velocity_update_prob
-            if torch.any(update_mask):
-                num_to_update = update_mask.sum()
-                
-                new_speeds = (torch.rand(num_to_update, device=self.device) *
-                              (self.domain_randomization_config.cylinder_speed_range[1] - self.domain_randomization_config.cylinder_speed_range[0]) +
-                              self.domain_randomization_config.cylinder_speed_range[0])
-                
-                new_directions = torch.randn(num_to_update, 3, device=self.device)
-                new_directions = new_directions / torch.linalg.norm(new_directions, dim=1, keepdim=True)
-                
-                self.obstacle_cylinder_velocity[update_mask] = new_directions * new_speeds.unsqueeze(1)
-
-        new_pos = current_cylinder_pose.p + self.obstacle_cylinder_velocity * dt
-
-        # Cylinder boundary reflection
-        for i in range(3):  # x, y, z axes
-            # Min boundary
-            hit_min = new_pos[:, i] < self.cylinder_ws_min[i]
-            new_pos[hit_min, i] = self.cylinder_ws_min[i] + (self.cylinder_ws_min[i] - new_pos[hit_min, i])
-            self.obstacle_cylinder_velocity[hit_min, i] *= -1
-            
-            # Max boundary
-            hit_max = new_pos[:, i] > self.cylinder_ws_max[i]
-            new_pos[hit_max, i] = self.cylinder_ws_max[i] - (new_pos[hit_max, i] - self.cylinder_ws_max[i])
-            self.obstacle_cylinder_velocity[hit_max, i] *= -1
-        # Clamp to ensure it stays strictly within bounds after potential multiple reflections/large dt
-        new_pos = torch.max(torch.min(new_pos, self.cylinder_ws_max.unsqueeze(0)), self.cylinder_ws_min.unsqueeze(0))
-
-        self.obstacle_cylinder.set_pose(Pose.create_from_pq(p=new_pos, q=current_cylinder_pose.q))
-
-        # Update camera poses
+        # update the camera poses before agent actions are executed
         if self.domain_randomization:
             self.camera_mount.set_pose(self.sample_camera_poses(n=self.num_envs))
-        if self.gpu_sim_enabled: # ensure kinematic updates are applied
-            self.scene._gpu_apply_all()
+            if self.gpu_sim_enabled:
+                self.scene._gpu_apply_all()
 
     def _get_obs_agent(self):
         # the default get_obs_agent function in ManiSkill records qpos and qvel. However
@@ -430,95 +514,85 @@ class SO100AvoidCylinderEnv(BaseDigitalTwinEnv):
         # we ensure that the observation data is always retrievable in the real world, using only real world
         # available data (joint positions or the controllers target joint positions in this case).
         obs = dict(
-            tcp_to_obstacle_pos=self.obstacle_cylinder.pose.p - self.agent.tcp_pose.p,
-            obstacle_pose=self.obstacle_cylinder.pose.raw_pose, # Raw pose [pos (3), quat (4)]
+            dist_to_rest_qpos=self.agent.controller._target_qpos[:, :-1]
+            - self.rest_qpos[:-1],
+            cylinder_pose=self.cylinder.pose.raw_pose,
+            tcp_to_cylinder_pos=self.cylinder.pose.p - self.agent.tcp_pos,
         )
         if self.obs_mode_struct.state:
             # state based policies can gain access to more information that helps learning
             obs.update(
+                is_grasped=info["is_grasped"],
+                obj_pose=self.cube.pose.raw_pose,
                 tcp_pos=self.agent.tcp_pos,
-                obstacle_velocity=self.obstacle_cylinder_velocity.clone(), # current velocity
+                tcp_to_obj_pos=self.cube.pose.p - self.agent.tcp_pos,
             )
         return obs
 
     def evaluate(self):
         # evaluation function to generate some useful metrics/flags and evaluate the success of the task
-        # Check for collision between robot and cylinder
-        dist_tcp_to_cylinder_center = torch.linalg.norm(self.obstacle_cylinder.pose.p - self.agent.tcp_pose.p, axis=-1)
 
-        # More accurate collision detection using contact forces
-        collided_with_obstacle = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        # Define robot links to check for collision.
-        # These are common links for the SO100 end-effector. You might want to add more links
-        # (e.g., forearm) if they are also likely to collide.
-        # Actual link names depend on the robot's URDF file.
-        # You can inspect all available link names via `self.agent.robot.links_map.keys()`
-        # or by checking the SO100 URDF file directly.
-        # The SO100 agent class defines:
-        # - self.agent.finger1_link (maps to "Fixed_Jaw")
-        # - self.agent.finger2_link (maps to "Moving_Jaw")
-        # For other arm links, we use common naming conventions derived from joint names.
-        robot_collision_links = [
-            self.agent.finger1_link,
-            self.agent.finger2_link,
-            self.agent.robot.joints_map["wrist_roll"].get_child_link(),  # End-effector base / "palm"
-            self.agent.robot.joints_map["wrist_flex"].get_child_link(),  # Part of the wrist/forearm
-            self.agent.robot.joints_map["elbow_flex"].get_child_link(), # Part of the forearm/upper arm
-        ]
+        tcp_to_obj_dist = torch.linalg.norm(
+            self.cube.pose.p - self.agent.tcp_pos,
+            axis=-1,
+        )
+        reached_object = tcp_to_obj_dist < 0.03
+        is_grasped = self.agent.is_grasping(self.cube)
 
-        for link in robot_collision_links:
-            contact_forces = self.scene.get_pairwise_contact_forces(link, self.obstacle_cylinder)
-            # If the norm of contact forces is greater than a small threshold, consider it a collision.
-            # The threshold (e.g., 1.0) might need tuning.
-            collided_with_obstacle = torch.logical_or(collided_with_obstacle, torch.linalg.norm(contact_forces, dim=1) > 1.0)
+        target_qpos = self.agent.controller._target_qpos.clone()
+        distance_to_rest_qpos = torch.linalg.norm(
+            target_qpos[:, :-1] - self.rest_qpos[:-1], axis=-1
+        )
+        reached_rest_qpos = distance_to_rest_qpos < 0.2
 
-        # Check if robot is touching the table (optional, but good for safety)
+        cube_lifted = self.cube.pose.p[..., -1] >= (self.cube_half_sizes + 1e-3)
+
+        success = cube_lifted & is_grasped & reached_rest_qpos
+
+        # determine if robot is touching the table. for safety reasons we want the robot to avoid hitting the table when grasping the cube
         l_contact_forces = self.scene.get_pairwise_contact_forces(
             self.agent.finger1_link, self.table_scene.table
         )
         r_contact_forces = self.scene.get_pairwise_contact_forces(
             self.agent.finger2_link, self.table_scene.table
         )
-        lforce = torch.linalg.norm(l_contact_forces, dim=1) # Use dim=1 for batched envs
-        rforce = torch.linalg.norm(r_contact_forces, dim=1)
+        lforce = torch.linalg.norm(l_contact_forces, axis=1)
+        rforce = torch.linalg.norm(r_contact_forces, axis=1)
         touching_table = torch.logical_or(
             lforce >= 1e-2,
             rforce >= 1e-2,
         )
 
-        success = torch.logical_not(collided_with_obstacle) # Success is defined as not colliding
-
         return {
-            "collided_with_obstacle": collided_with_obstacle,
-            "dist_tcp_to_cylinder": dist_tcp_to_cylinder_center,
+            "is_grasped": is_grasped,
+            "reached_object": reached_object,
+            "distance_to_rest_qpos": distance_to_rest_qpos,
             "touching_table": touching_table,
+            "cube_lifted": cube_lifted,
             "success": success,
         }
 
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: Dict):
+        # note the info object is the data returned by the evaluate function. We can reuse information
+        # to save compute time.
+        # this reward function essentially has two stages, before and after grasping.
+        # in stage 1 we reward the robot for reaching the object and grasping it.
+        # in stage 2 if the robot is grasping the object, we reward it for controlling the robot returning to the predefined rest pose.
+        # in all stages we penalize the robot for touching the table.
+        # this reward function is very simple and can easily be improved to learn more robust behaviors or solve more complex problems.
 
-        # Reward for keeping distance from the cylinder
-        distance_reward = torch.tanh(info["dist_tcp_to_cylinder"]) # Max 1?
-        reward = distance_reward
-
-        # Optional: Penalty for touching the table
-        table_penalty_value = 0.5
-        reward -= table_penalty_value * info["touching_table"].float()
-
-        # Large negative penalty for collision
-        collision_penalty_value = -1.0
-        reward = torch.where(info["collided_with_obstacle"], torch.full_like(reward, collision_penalty_value), reward)
-
+        tcp_to_obj_dist = torch.linalg.norm(
+            self.cube.pose.p - self.agent.tcp_pose.p, axis=1
+        )
+        reaching_reward = 1 - torch.tanh(5 * tcp_to_obj_dist)
+        reward = reaching_reward + info["is_grasped"]
+        place_reward = torch.exp(-2 * info["distance_to_rest_qpos"])
+        reward += place_reward * info["is_grasped"]
+        reward -= 2 * info["touching_table"].float()
         return reward
 
     def compute_normalized_dense_reward(
         self, obs: Any, action: torch.Tensor, info: Dict
     ):
-        raw_reward = self.compute_dense_reward(obs=obs, action=action, info=info)
-
-       
-        return raw_reward
-
-    # Override compute_terminated to end episode on collision
-    def compute_terminated(self, obs: Any, action: torch.Tensor, info: Dict[str, Any]) -> torch.Tensor:
-        return info["collided_with_obstacle"]
+        # for more stable RL we often also permit defining a noramlized reward function where you manually scale the reward down by its max value like so
+        return self.compute_dense_reward(obs=obs, action=action, info=info) / 3
