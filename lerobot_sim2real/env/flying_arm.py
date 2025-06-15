@@ -167,6 +167,20 @@ class SO100AvoidCylinderEnv(BaseDigitalTwinEnv):
             and self.domain_randomization_config.robot_color == "random"
             else False,
         )
+        # Limit the base swivel joint (shoulder_pan, which is the first joint)
+        # self.agent.robot.active_joints is a list of sapien.Joint objects.
+        if self.agent.robot.active_joints: # Check if there are any active joints
+            base_swivel_joint = self.agent.robot.active_joints[0]
+
+            # Convert 45 degrees to radians
+            swivel_limit_rad = np.deg2rad(45)
+            
+            # sapien.Joint.set_limits expects a (1, 2) array for a 1-DOF joint: [[lower_limit, upper_limit]]
+            new_joint_limits = np.array([[-swivel_limit_rad, swivel_limit_rad]], dtype=np.float32)
+            
+            base_swivel_joint.set_limits(new_joint_limits)
+        else:
+            logger.warning("Robot has no active joints, cannot set joint limits for base swivel.")
 
     def _load_lighting(self, options: dict):
         self.scene.set_ambient_light([0.3, 0.3, 0.3])
