@@ -9,6 +9,9 @@ import numpy as np
 import tyro
 from dataclasses import dataclass
 
+# Import to register custom environments
+import lerobot_sim2real.env
+
 @dataclass
 class Args:
     env_id: str

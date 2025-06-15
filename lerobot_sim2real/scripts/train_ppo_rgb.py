@@ -7,6 +7,9 @@ import tyro
 
 from lerobot_sim2real.rl.ppo_rgb import PPOArgs, train
 
+# Import to register custom environments
+import lerobot_sim2real.env
+
 @dataclass
 class Args:
     env_id: str

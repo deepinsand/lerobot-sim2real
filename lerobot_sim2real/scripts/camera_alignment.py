@@ -77,8 +77,10 @@ def update_camera(sim_env):
         fov_offset += FOV_CHANGE_SPEED * delta_time
 
     # update camera position and fov
-    pos = sim_env.unwrapped.base_camera_settings["pos"] + camera_offset
-    pose = sapien_utils.look_at(pos, sim_env.unwrapped.base_camera_settings["target"])
+    pos = sim_env.unwrapped.base_camera_settings["pos"]# + camera_offset
+    target = sim_env.unwrapped.base_camera_settings["target"] + camera_offset
+
+    pose = sapien_utils.look_at(pos, target)
     sim_env.unwrapped.camera_mount.set_pose(pose)
     sim_env.unwrapped._sensors["base_camera"].camera.set_fovy(
         sim_env.unwrapped.base_camera_settings["fov"] + fov_offset
@@ -90,6 +92,7 @@ def update_camera(sim_env):
             "current_camera_fov",
             sim_env.unwrapped.base_camera_settings["fov"] + fov_offset,
         )
+        print("current_target_position", target)
         help_message_printed = False  # Reset the flag when there's movement
     elif (
         not help_message_printed

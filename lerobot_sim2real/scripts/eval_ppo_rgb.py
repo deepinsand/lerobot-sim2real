@@ -21,6 +21,10 @@ from mani_skill.utils.wrappers.record import RecordEpisode
 from tqdm import tqdm
 from mani_skill.utils.visualization import tile_images
 import matplotlib.pyplot as plt
+
+# Import to register custom environments
+import lerobot_sim2real.env
+
 @dataclass
 class Args:
     checkpoint: Optional[str] = None

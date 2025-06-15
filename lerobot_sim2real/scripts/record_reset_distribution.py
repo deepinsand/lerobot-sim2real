@@ -6,6 +6,9 @@ from mani_skill.utils.wrappers.record import RecordEpisode
 import tyro
 
 
+# Import to register custom environments
+import lerobot_sim2real.env
+
 @dataclass
 class Args:
     env_id: str = "SO100GraspCube-v1"
