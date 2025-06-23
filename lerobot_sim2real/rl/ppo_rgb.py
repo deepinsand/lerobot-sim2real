@@ -1,6 +1,5 @@
-"""CleanRL Style PPO implementation for visual RL in ManiSkill. Taken from https://github.com/haosulab/ManiSkill/blob/main/examples/baselines/ppo
-
-Only modification is Args is renamed to PPOArgs, the main function is put inside a train function for cross-module use, and we provide support to modify env kwargs
+"""
+EPO (Evolutionary Policy Optimization) implementation for visual RL in ManiSkill.
 """
 from collections import defaultdict
 import json
@@ -8,15 +7,13 @@ import os
 import random
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Union
 
 import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import tyro
-from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
 # ManiSkill specific imports
@@ -26,8 +23,17 @@ from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper, Flatten
 from mani_skill.utils.wrappers.record import RecordEpisode
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 
+# EPO specific imports
+from evolutionary_policy_optimization import (
+    LatentGenePool,
+    Actor as BaseEPOActor, # Renamed to avoid potential conflicts if Actor is defined elsewhere
+    Critic as BaseEPOCritic # Renamed
+)
+import torch.optim as optim # Import optim
+
+
 @dataclass
-class PPOArgs:
+class EPOArgs:
     exp_name: Optional[str] = None
     """the name of this experiment"""
     seed: int = 1
@@ -39,7 +45,7 @@ class PPOArgs:
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "ManiSkill"
-    """the wandb's project name"""
+    """the wandb project name"""
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
     wandb_group: str = "PPO"
@@ -61,11 +67,9 @@ class PPOArgs:
     env_kwargs: dict = field(default_factory=dict)
     """extra environment kwargs to pass to the environment"""
     include_state: bool = True
-    """whether to include state information in observations"""
+    """whether to include low-dimensional state information in observations along with RGB"""
     total_timesteps: int = 10000000
     """total timesteps of the experiments"""
-    learning_rate: float = 3e-4
-    """the learning rate of the optimizer"""
     num_envs: int = 512
     """the number of parallel environments"""
     num_eval_envs: int = 8
@@ -74,8 +78,8 @@ class PPOArgs:
     """whether to let parallel environments reset upon termination instead of truncation"""
     eval_partial_reset: bool = False
     """whether to let parallel evaluation environments reset upon termination instead of truncation"""
-    num_steps: int = 50
-    """the number of steps to run in each environment per policy rollout"""
+    num_steps_per_latent_eval: int = 200 # Renamed from num_steps
+    """the number of steps to run in each environment for evaluating a single latent vector"""
     num_eval_steps: int = 50
     """the number of steps to run in each evaluation environment during evaluation"""
     reconfiguration_freq: Optional[int] = None
@@ -84,37 +88,56 @@ class PPOArgs:
     """for benchmarking purposes we want to reconfigure the eval environment each reset to ensure objects are randomized in some tasks"""
     control_mode: Optional[str] = None
     """the control mode to use for the environment"""
-    anneal_lr: bool = False
-    """Toggle learning rate annealing for policy and value networks"""
-    gamma: float = 0.8
+    reward_scale: float = 1.0
+    """Scale the reward by this factor"""
+    eval_freq: int = 25
+    """evaluation frequency in terms of generations"""
+    save_train_video_freq: Optional[int] = None
+    """frequency to save training videos in terms of generations"""
+
+    # EPO specific arguments
+    num_latents: int = 128
+    """Number of latent vectors (genes) in the population"""
+    dim_latent: int = 32
+    """Dimension of each latent vector"""
+    actor_mlp_depth: int = 2
+    """MLP depth for the EPO actor"""
+    critic_mlp_depth: int = 3
+    """MLP depth for the EPO critic"""
+    actor_dim: int = 256
+    """Hidden dimension for the EPO actor MLP"""
+    critic_dim: int = 256
+    """Hidden dimension for the EPO critic MLP"""
+
+    # PPO specific arguments
+    learning_rate: float = 2.5e-4
+    """the learning rate of the optimizer"""
+    gamma: float = 0.99
     """the discount factor gamma"""
-    gae_lambda: float = 0.9
+    gae_lambda: float = 0.95
     """the lambda for the general advantage estimation"""
-    num_minibatches: int = 32
+    num_minibatches: int = 32 # PPO typically uses 32 or similar
     """the number of mini-batches"""
     update_epochs: int = 4
-    """the K epochs to update the policy"""
+    """The K epochs to update the policy"""
     norm_adv: bool = True
     """Toggles advantages normalization"""
     clip_coef: float = 0.2
     """the surrogate clipping coefficient"""
-    clip_vloss: bool = False
+    clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.0
+    ent_coef: float = 0.01
     """coefficient of the entropy"""
     vf_coef: float = 0.5
     """coefficient of the value function"""
     max_grad_norm: float = 0.5
     """the maximum norm for the gradient clipping"""
-    target_kl: float = 0.2
+    target_kl: Optional[float] = None
     """the target KL divergence threshold"""
-    reward_scale: float = 1.0
-    """Scale the reward by this factor"""
-    eval_freq: int = 25
-    """evaluation frequency in terms of iterations"""
-    save_train_video_freq: Optional[int] = None
-    """frequency to save training videos in terms of iterations"""
+    anneal_lr: bool = True
+    """Toggle learning rate annealing"""
     finite_horizon_gae: bool = False
+    """Whether to use finite horizon GAE calculation variant"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -122,12 +145,8 @@ class PPOArgs:
     minibatch_size: int = 0
     """the mini-batch size (computed in runtime)"""
     num_iterations: int = 0
-    """the number of iterations (computed in runtime)"""
+    """the number of generations (computed in runtime, renamed from num_iterations)"""
 
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias_const)
-    return layer
 
 class DictArray(object):
     def __init__(self, buffer_shape, element_space, data_dict=None, device=None):
@@ -238,51 +257,131 @@ class NatureCNN(nn.Module):
             encoded_tensor_list.append(extractor(obs))
         return torch.cat(encoded_tensor_list, dim=1)
 
-class Agent(nn.Module):
-    def __init__(self, envs, sample_obs):
+class EPOAgent(nn.Module):
+    def __init__(self, sample_obs, action_space_shape, args: EPOArgs, device):
         super().__init__()
-        self.feature_net = NatureCNN(sample_obs=sample_obs)
-        # latent_size = np.array(envs.unwrapped.single_observation_space.shape).prod()
-        latent_size = self.feature_net.out_features
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(latent_size, 512)),
-            nn.ReLU(inplace=True),
-            layer_init(nn.Linear(512, 1)),
+        self.device = device
+        self.feature_extractor = NatureCNN(sample_obs=sample_obs)
+
+        # Determine dim_state from feature_extractor output
+        with torch.no_grad():
+            # Create a dummy batch of observations (use CPU for this temporary operation)
+            # Ensure dummy_obs structure matches what NatureCNN expects from sample_obs
+            dummy_obs_dict_cpu = {}
+            for k, v_tensor in sample_obs.items():
+                dummy_obs_dict_cpu[k] = torch.zeros((1,) + v_tensor.shape[1:], dtype=v_tensor.dtype, device="cpu")
+            
+            temp_feature_extractor = NatureCNN(sample_obs=dummy_obs_dict_cpu).to("cpu")
+            dummy_features = temp_feature_extractor(dummy_obs_dict_cpu)
+        dim_state = dummy_features.shape[1]
+
+        self.num_actions = np.prod(action_space_shape)
+        self.actor_log_std = nn.Parameter(torch.zeros(1, self.num_actions, device=device))
+        self.latent_pool = LatentGenePool(
+            num_latents=args.num_latents,
+            dim_latent=args.dim_latent,
         )
-        self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(latent_size, 512)),
-            nn.ReLU(inplace=True),
-            layer_init(nn.Linear(512, np.prod(envs.unwrapped.single_action_space.shape)), std=0.01*np.sqrt(2)),
+        
+        self.actor = BaseEPOActor(
+            dim_state=dim_state,
+            dim=args.actor_dim,
+            mlp_depth=args.actor_mlp_depth,
+            num_actions=self.num_actions,
+            dim_latent=args.dim_latent
         )
-        self.actor_logstd = nn.Parameter(torch.ones(1, np.prod(envs.unwrapped.single_action_space.shape)) * -0.5)
-    def get_features(self, x):
-        return self.feature_net(x)
-    def get_value(self, x):
-        x = self.feature_net(x)
-        return self.critic(x)
-    def get_action(self, x, deterministic=False):
-        x = self.feature_net(x)
-        action_mean = self.actor_mean(x)
+        
+        self.critic = BaseEPOCritic(
+            dim_state=dim_state,
+            dim=args.critic_dim,
+            mlp_depth=args.critic_mlp_depth,
+            dim_latent=args.dim_latent
+        )
+
+    def get_action(self, obs, latent_id: int, deterministic: bool = True):
+        features = self.feature_extractor(obs)
+        # self.latent_pool is an nn.Parameter, so it's on the correct device via agent.to(device)
+        current_latents = self.latent_pool(latent_id=latent_id) 
+
+        # Expand latent to match batch size of features
+        # actor expects features: (B, D_state), latent_batch: (B, D_latent)
+        latent_batch = current_latents
+        if features.ndim > 0 and features.shape[0] > 0: # Should always be true for valid observation features
+            batch_size = features.shape[0] if features.ndim > 1 else 1
+            if current_latents.ndim == 1: # current_latents is (D_latent), features are batched
+                 latent_batch = current_latents.unsqueeze(0).expand(batch_size, -1)
+            # If current_latents is already batched (e.g. (B, D_latent)), use as is.
+            # This is unlikely from self.latent_pool(latent_id) which returns one latent.
+
+        action_mean = self.actor(features, latent_batch) # Assuming EPOActor returns only mean
         if deterministic:
-            return action_mean
-        action_logstd = self.actor_logstd.expand_as(action_mean)
-        action_std = torch.exp(action_logstd)
-        probs = Normal(action_mean, action_std)
-        return probs.sample()
-    def get_action_and_value(self, x, action=None):
-        x = self.feature_net(x)
-        action_mean = self.actor_mean(x)
-        action_logstd = self.actor_logstd.expand_as(action_mean)
-        action_std = torch.exp(action_logstd)
-        probs = Normal(action_mean, action_std)
-        if action is None:
-            action = probs.sample()
-        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
+            act = action_mean
+        else:
+            action_log_std = self.actor_log_std.expand_as(action_mean)
+            action_std = torch.exp(action_log_std)
+            distribution = torch.distributions.Normal(action_mean, action_std)
+            act = distribution.sample()
+        return act.detach() # Always detach actions produced by get_action
+
+    def get_value(self, obs, latent_id: int):
+        features = self.feature_extractor(obs)
+        current_latents = self.latent_pool(latent_id=latent_id)
+
+        latent_batch = current_latents
+        if features.ndim > 0 and features.shape[0] > 0:
+            batch_size = features.shape[0] if features.ndim > 1 else 1
+            if current_latents.ndim == 1: # current_latents is (D_latent), features are batched
+                 latent_batch = current_latents.unsqueeze(0).expand(batch_size, -1)
+
+        return self.critic(features, latent_batch)
+
+    def genetic_step(self, fitness_scores: torch.Tensor):
+        self.latent_pool.genetic_algorithm_step(fitness_scores)
+
+    def get_action_and_value(self, obs, latent_id: Union[int, torch.Tensor], action: Optional[torch.Tensor] = None):
+        features = self.feature_extractor(obs)
+        current_latents = self.latent_pool(latent_id=latent_id) # Can be (D_latent) or (B, D_latent)
+
+        latent_batch = current_latents
+        if features.ndim > 0 and features.shape[0] > 0:
+            batch_size = features.shape[0] if features.ndim > 1 else 1
+            if current_latents.ndim == 1 and batch_size > 1 : # current_latents is (D_latent), features are (B, D_features)
+                 latent_batch = current_latents.unsqueeze(0).expand(batch_size, -1)
+        # If current_latents is (B, D_latent) and features is (B, D_features), latent_batch is already correct.
+
+        action_mean = self.actor(features, latent_batch) # Assuming EPOActor returns only mean
+        action_log_std = self.actor_log_std.expand_as(action_mean)
+        action_std = torch.exp(action_log_std)
+        value = self.critic(features, latent_batch)
+
+        distribution = torch.distributions.Normal(action_mean, action_std)
+        if action is None: # Sample action if not provided
+            sampled_action = distribution.sample()
+        else: # Use provided action (e.g., from replay buffer during PPO update)
+            sampled_action = action
+        
+        log_prob = distribution.log_prob(sampled_action).sum(axis=-1) # Sum over action dimensions
+        entropy = distribution.entropy().sum(axis=-1) # Sum over action dimensions
+        
+        return sampled_action, log_prob, entropy, value
+
+class GenerationBasedTrigger:
+    def __init__(self, freq):
+        self.freq = freq
+        self.current_generation = 0
+
+    def __call__(self, episode_id): # episode_id is passed by RecordEpisode
+        if self.freq is None or self.freq <= 0:
+            return False
+        return self.current_generation > 0 and self.current_generation % self.freq == 0
+
+    def set_generation(self, generation):
+        self.current_generation = generation
 
 class Logger:
     def __init__(self, log_wandb=False, tensorboard: SummaryWriter = None) -> None:
         self.writer = tensorboard
         self.log_wandb = log_wandb
+
     def add_scalar(self, tag, scalar_value, step):
         if self.log_wandb:
             import wandb
@@ -291,10 +390,24 @@ class Logger:
     def close(self):
         self.writer.close()
 
-def train(args: PPOArgs):
-    args.batch_size = int(args.num_envs * args.num_steps)
-    args.minibatch_size = int(args.batch_size // args.num_minibatches)
-    args.num_iterations = args.total_timesteps // args.batch_size
+def train(args: EPOArgs):
+    # Calculate number of generations based on total_timesteps
+    # Each latent is evaluated for num_steps_per_latent_eval across num_envs
+    env_steps_per_generation = args.num_latents * args.num_envs * args.num_steps_per_latent_eval
+    if env_steps_per_generation == 0 :
+        raise ValueError("env_steps_per_generation is zero. Check num_latents, num_envs, or num_steps_per_latent_eval.")
+    args.num_iterations = args.total_timesteps // env_steps_per_generation # num_iterations is num_generations
+
+    # Calculate batch_size and minibatch_size for PPO
+    # This batch_size is for the PPO update, accumulating data from all latents
+    args.batch_size = int(args.num_latents * args.num_envs * args.num_steps_per_latent_eval)
+    if args.num_minibatches > 0:
+        args.minibatch_size = int(args.batch_size // args.num_minibatches)
+    else: 
+        args.minibatch_size = args.batch_size
+        if args.batch_size > 0: # Avoid division by zero if batch_size is 0
+            args.num_minibatches = 1 # Ensure num_minibatches is at least 1 if minibatch_size is batch_size
+
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
         run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
@@ -311,33 +424,45 @@ def train(args: PPOArgs):
 
     # env setup
     env_kwargs = dict(
-        obs_mode="rgb+segmentation", render_mode=args.render_mode, sim_backend="physx_cpu",
+        obs_mode="rgb+segmentation", render_mode=args.render_mode, sim_backend=("physx_cuda" if torch.cuda.is_available() and args.cuda else "physx_cpu"),
     )
     if args.control_mode is not None:
         env_kwargs["control_mode"] = args.control_mode
     env_kwargs.update(args.env_kwargs)
 
-    eval_envs = gym.make(args.env_id, num_envs=1, reconfiguration_freq=args.eval_reconfiguration_freq, **env_kwargs)
-    envs = gym.make(args.env_id, num_envs=1, reconfiguration_freq=args.reconfiguration_freq, **env_kwargs)
+    # Create base single environments
+    base_eval_env = gym.make(args.env_id, num_envs=args.num_eval_envs, reconfiguration_freq=args.eval_reconfiguration_freq, **env_kwargs)
+    base_train_env = gym.make(args.env_id, num_envs=args.num_envs if not args.evaluate else 1, reconfiguration_freq=args.reconfiguration_freq, **env_kwargs)
 
     # rgbd obs mode returns a dict of data, we flatten it so there is just a rgbd key and state key
-    envs = FlattenRGBDObservationWrapper(envs, rgb=True, depth=False, state=args.include_state)
-    eval_envs = FlattenRGBDObservationWrapper(eval_envs, rgb=True, depth=False, state=args.include_state)
+    wrapped_single_train_env = FlattenRGBDObservationWrapper(base_train_env, rgb=True, depth=False, state=args.include_state)
+    wrapped_single_eval_env = FlattenRGBDObservationWrapper(base_eval_env, rgb=True, depth=False, state=args.include_state)
 
-    if isinstance(envs.action_space, gym.spaces.Dict):
-        envs = FlattenActionSpaceWrapper(envs)
-        eval_envs = FlattenActionSpaceWrapper(eval_envs)
+    if isinstance(wrapped_single_train_env.action_space, gym.spaces.Dict):
+        wrapped_single_train_env = FlattenActionSpaceWrapper(wrapped_single_train_env)
+        wrapped_single_eval_env = FlattenActionSpaceWrapper(wrapped_single_eval_env)
+
+
+    training_video_trigger = None
     if args.capture_video:
         eval_output_dir = f"runs/{run_name}/videos"
         if args.evaluate:
             eval_output_dir = f"{os.path.dirname(args.checkpoint)}/test_videos"
         print(f"Saving eval videos to {eval_output_dir}")
         if args.save_train_video_freq is not None:
-            save_video_trigger = lambda x : (x // args.num_steps) % args.save_train_video_freq == 0
-            envs = RecordEpisode(envs, output_dir=f"runs/{run_name}/train_videos", save_trajectory=False, save_video_trigger=save_video_trigger, max_steps_per_video=args.num_steps, video_fps=eval_envs.unwrapped.control_freq)
-        eval_envs = RecordEpisode(eval_envs, output_dir=eval_output_dir, save_trajectory=args.evaluate, trajectory_name="trajectory", max_steps_per_video=args.num_eval_steps, video_fps=eval_envs.unwrapped.control_freq, info_on_video=True)
-    envs = ManiSkillVectorEnv(envs, args.num_envs, ignore_terminations=not args.partial_reset, record_metrics=True)
-    eval_envs = ManiSkillVectorEnv(eval_envs, args.num_eval_envs, ignore_terminations=not args.eval_partial_reset, record_metrics=True)
+            training_video_trigger = GenerationBasedTrigger(args.save_train_video_freq)
+            wrapped_single_train_env = RecordEpisode(
+                wrapped_single_train_env, 
+                output_dir=f"runs/{run_name}/train_videos", 
+                save_trajectory=False, 
+                save_video_trigger=training_video_trigger, 
+                max_steps_per_video=args.num_steps_per_latent_eval, 
+                video_fps=wrapped_single_train_env.control_freq if hasattr(wrapped_single_train_env, 'control_freq') else 30 # Use actual control_freq
+            )
+        wrapped_single_eval_env = RecordEpisode(wrapped_single_eval_env, output_dir=eval_output_dir, save_trajectory=args.evaluate, trajectory_name="trajectory", max_steps_per_video=args.num_eval_steps, video_fps=wrapped_single_eval_env.control_freq if hasattr(wrapped_single_eval_env, 'control_freq') else 30, info_on_video=True)
+
+    envs = ManiSkillVectorEnv(wrapped_single_train_env, args.num_envs, ignore_terminations=not args.partial_reset, record_metrics=True)
+    eval_envs = ManiSkillVectorEnv(wrapped_single_eval_env, args.num_eval_envs, ignore_terminations=not args.eval_partial_reset, record_metrics=True)
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     max_episode_steps = gym_utils.find_max_episode_steps_value(envs._env)
@@ -355,7 +480,7 @@ def train(args: PPOArgs):
                 sync_tensorboard=False,
                 config=config,
                 name=run_name,
-                save_code=True,
+                save_code=True, # Note: wandb save_code might have issues with large projects
                 group=args.wandb_group,
                 tags=["ppo", "walltime_efficient"]
             )
@@ -369,12 +494,20 @@ def train(args: PPOArgs):
         print("Running evaluation")
 
     # ALGO Logic: Storage setup
-    obs = DictArray((args.num_steps, args.num_envs), envs.single_observation_space, device=device)
-    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
-    logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    # These buffers will store data for one full generation (all latents) for PPO update
+    ppo_buffer_num_samples = args.num_latents * args.num_steps_per_latent_eval * args.num_envs
+    
+    # Check if ppo_buffer_num_samples is zero before creating tensors
+    if ppo_buffer_num_samples == 0:
+        raise ValueError("ppo_buffer_num_samples is zero. Check EPO args: num_latents, num_steps_per_latent_eval, num_envs.")
+
+    ppo_obs = DictArray((ppo_buffer_num_samples,), envs.single_observation_space, device=device)
+    ppo_actions = torch.zeros((ppo_buffer_num_samples,) + envs.single_action_space.shape, device=device)
+    ppo_logprobs = torch.zeros(ppo_buffer_num_samples, device=device)
+    ppo_advantages = torch.zeros(ppo_buffer_num_samples, device=device)
+    ppo_returns = torch.zeros(ppo_buffer_num_samples, device=device)
+    ppo_values = torch.zeros(ppo_buffer_num_samples, device=device)
+    ppo_latent_ids = torch.zeros(ppo_buffer_num_samples, dtype=torch.long, device=device)
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
@@ -382,11 +515,15 @@ def train(args: PPOArgs):
     next_obs, _ = envs.reset(seed=args.seed)
     eval_obs, _ = eval_envs.reset(seed=args.seed)
     next_done = torch.zeros(args.num_envs, device=device)
+    print(f"#### EPO Setup ####")
+    print(f"Num Generations (args.num_iterations): {args.num_iterations}, Num Envs: {args.num_envs}, Num Eval Envs: {args.num_eval_envs}")
+    print(f"PPO Batch Size (total samples per gen): {args.batch_size}, PPO Minibatch Size: {args.minibatch_size}, PPO Update Epochs: {args.update_epochs}")
     print(f"####")
-    print(f"args.num_iterations={args.num_iterations} args.num_envs={args.num_envs} args.num_eval_envs={args.num_eval_envs}")
-    print(f"args.minibatch_size={args.minibatch_size} args.batch_size={args.batch_size} args.update_epochs={args.update_epochs}")
-    print(f"####")
-    agent = Agent(envs, sample_obs=next_obs).to(device)
+    agent = EPOAgent(sample_obs=next_obs,
+                     action_space_shape=envs.single_action_space.shape,
+                     args=args,
+                     device=device).to(device)
+
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     if args.checkpoint:
@@ -394,11 +531,23 @@ def train(args: PPOArgs):
 
     cumulative_times = defaultdict(float)
 
-    for iteration in range(1, args.num_iterations + 1):
-        print(f"Epoch: {iteration}, global_step={global_step}")
-        final_values = torch.zeros((args.num_steps, args.num_envs), device=device)
+    for generation in range(1, args.num_iterations + 1):
+        generation_start_time = time.time()
+        print(f"Generation: {generation}/{args.num_iterations}, Global Step: {global_step}")
+        if training_video_trigger:
+            training_video_trigger.set_generation(generation)
         agent.eval()
-        if iteration % args.eval_freq == 1:
+        # Variables for PPO data collection for the entire generation
+        current_ppo_buffer_idx = 0
+        generation_fitness_scores = torch.zeros(args.num_latents, device=device)
+
+        # Store next_obs and next_done to carry over between latent evaluations if not resetting envs per latent
+        # If envs are reset per latent, these would be reset inside the latent loop.
+        # Current PPO structure implies continuous rollouts, so we carry them over.
+        # next_obs is already carried from previous iteration/generation.
+        # next_done is also carried.
+
+        if generation % args.eval_freq == 0 or generation == 1: # Evaluate at start and then periodically
             print("Evaluating")
             stime = time.perf_counter()
             eval_obs, _ = eval_envs.reset()
@@ -406,7 +555,9 @@ def train(args: PPOArgs):
             num_episodes = 0
             for _ in range(args.num_eval_steps):
                 with torch.no_grad():
-                    eval_obs, eval_rew, eval_terminations, eval_truncations, eval_infos = eval_envs.step(agent.get_action(eval_obs, deterministic=True))
+                    # Using latent_id=0 for evaluation (can be changed to best_latent_id if tracked)
+                    eval_action = agent.get_action(eval_obs, latent_id=0, deterministic=True) 
+                    eval_obs, eval_rew, eval_terminations, eval_truncations, eval_infos = eval_envs.step(eval_action)
                     if "final_info" in eval_infos:
                         mask = eval_infos["_final_info"]
                         num_episodes += mask.sum()
@@ -424,99 +575,127 @@ def train(args: PPOArgs):
                 logger.add_scalar("time/eval_time", eval_time, global_step)
             if args.evaluate:
                 break
-        if args.save_model and iteration % args.eval_freq == 1:
-            model_path = f"runs/{run_name}/ckpt_{iteration}.pt"
+        if args.save_model and (generation % args.eval_freq == 0 or generation == 1 or generation == args.num_iterations):
+            model_path = f"runs/{run_name}/ckpt_gen_{generation}.pt"
             torch.save(agent.state_dict(), model_path)
             print(f"model saved to {model_path}")
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
-            frac = 1.0 - (iteration - 1.0) / args.num_iterations
+            frac = 1.0 - (generation - 1.0) / args.num_iterations
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
         rollout_time = time.perf_counter()
-        for step in range(0, args.num_steps):
-            global_step += args.num_envs
-            obs[step] = next_obs
-            dones[step] = next_done
 
-            # ALGO LOGIC: action logic
-            with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
-                values[step] = value.flatten()
-            actions[step] = action
-            logprobs[step] = logprob
+        # Latent Evaluation Loop
+        for latent_idx in range(args.num_latents):
+            # Buffers for the current latent's rollout data
+            latent_obs_buffer = DictArray((args.num_steps_per_latent_eval, args.num_envs), envs.single_observation_space, device=device)
+            latent_actions_buffer = torch.zeros((args.num_steps_per_latent_eval, args.num_envs) + envs.single_action_space.shape, device=device)
+            latent_logprobs_buffer = torch.zeros((args.num_steps_per_latent_eval, args.num_envs), device=device)
+            latent_rewards_buffer = torch.zeros((args.num_steps_per_latent_eval, args.num_envs), device=device)
+            latent_dones_buffer = torch.zeros((args.num_steps_per_latent_eval, args.num_envs), device=device)
+            latent_values_buffer = torch.zeros((args.num_steps_per_latent_eval, args.num_envs), device=device)
+            # For GAE: V(s_T) if episode terminates at step t for an env
+            latent_final_values_for_gae = torch.zeros((args.num_steps_per_latent_eval, args.num_envs), device=device)
+            
+            current_latent_total_reward = 0.0
 
-            # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, terminations, truncations, infos = envs.step(action)
-            next_done = torch.logical_or(terminations, truncations).to(torch.float32)
-            rewards[step] = reward.view(-1) * args.reward_scale
+            for step in range(args.num_steps_per_latent_eval):
+                global_step += args.num_envs # Global step increments for each env step
+                latent_obs_buffer[step] = next_obs # next_obs is from previous step/latent
+                latent_dones_buffer[step] = next_done # next_done is from previous step/latent
 
-            if "final_info" in infos:
-                final_info = infos["final_info"]
-                done_mask = infos["_final_info"]
-                for k, v in final_info["episode"].items():
-                    logger.add_scalar(f"train/{k}", v[done_mask].float().mean(), global_step)
-
-                for k in infos["final_observation"]:
-                    infos["final_observation"][k] = infos["final_observation"][k][done_mask]
                 with torch.no_grad():
-                    final_values[step, torch.arange(args.num_envs, device=device)[done_mask]] = agent.get_value(infos["final_observation"]).view(-1)
+                    action, logprob, _, value = agent.get_action_and_value(next_obs, latent_id=latent_idx)
+                    latent_values_buffer[step] = value.flatten()
+                latent_actions_buffer[step] = action
+                latent_logprobs_buffer[step] = logprob
+
+                obs_after_step, reward, terminations, truncations, infos = envs.step(action)
+                current_done_flags = torch.logical_or(terminations, truncations).to(torch.float32)
+                latent_rewards_buffer[step] = reward.view(-1) * args.reward_scale
+                current_latent_total_reward += latent_rewards_buffer[step].sum().item()
+
+                if "final_info" in infos and logger:
+                    final_info = infos["final_info"]
+                    done_mask = infos["_final_info"]
+                    for k_info, v_info in final_info["episode"].items():
+                        if done_mask.any():
+                            logger.add_scalar(f"train_latent_{latent_idx}/{k_info}", v_info[done_mask].float().mean(), global_step)
+                    
+                    if "final_observation" in infos and done_mask.any():
+                        final_obs_for_value = {k_obs: obs_val[done_mask] for k_obs, obs_val in infos["final_observation"].items() if obs_val is not None}
+                        if final_obs_for_value: # Ensure there's actual observation data
+                            with torch.no_grad():
+                                terminal_value = agent.get_value(final_obs_for_value, latent_id=latent_idx).view(-1)
+                                latent_final_values_for_gae[step, done_mask] = terminal_value
+                
+                next_obs = obs_after_step
+                next_done = current_done_flags
+
+            generation_fitness_scores[latent_idx] = current_latent_total_reward / (args.num_steps_per_latent_eval * args.num_envs) # Avg reward as fitness
+
+            # GAE Calculation for this latent's data
+            with torch.no_grad():
+                # Value of the state after the last step of this latent's rollout
+                next_value_for_gae = agent.get_value(next_obs, latent_id=latent_idx).reshape(1, -1)
+                advantages_for_latent = torch.zeros_like(latent_rewards_buffer).to(device)
+                lastgaelam = 0
+                for t in reversed(range(args.num_steps_per_latent_eval)):
+                    if t == args.num_steps_per_latent_eval - 1:
+                        nextnonterminal = 1.0 - next_done # next_done is after this latent's last step
+                        nextvalues_gae = next_value_for_gae
+                    else:
+                        nextnonterminal = 1.0 - latent_dones_buffer[t + 1]
+                        nextvalues_gae = latent_values_buffer[t + 1]
+                    
+                    # If an episode terminated at step t, latent_final_values_for_gae[t] contains V(s_T)
+                    # Otherwise, it's zero.
+                    # delta incorporates V(s_T) if terminated, or gamma * V(s_{t+1}) if not.
+                    delta = latent_rewards_buffer[t] + args.gamma * (nextnonterminal * nextvalues_gae + latent_final_values_for_gae[t]) - latent_values_buffer[t]
+                    advantages_for_latent[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+                returns_for_latent = advantages_for_latent + latent_values_buffer
+
+            # Store this latent's data into the generation-wide PPO buffers
+            start_idx = current_ppo_buffer_idx
+            end_idx = start_idx + args.num_steps_per_latent_eval * args.num_envs
+            
+            flat_latent_obs = latent_obs_buffer.reshape((-1,))
+            for k_obs in ppo_obs.keys():
+                ppo_obs[k_obs][start_idx:end_idx] = flat_latent_obs[k_obs]
+            
+            ppo_actions[start_idx:end_idx] = latent_actions_buffer.reshape((-1,) + envs.single_action_space.shape)
+            ppo_logprobs[start_idx:end_idx] = latent_logprobs_buffer.reshape(-1)
+            ppo_advantages[start_idx:end_idx] = advantages_for_latent.reshape(-1)
+            ppo_returns[start_idx:end_idx] = returns_for_latent.reshape(-1)
+            ppo_values[start_idx:end_idx] = latent_values_buffer.reshape(-1)
+            ppo_latent_ids[start_idx:end_idx] = torch.full(((args.num_steps_per_latent_eval * args.num_envs),), latent_idx, device=device, dtype=torch.long)
+            current_ppo_buffer_idx = end_idx
+
         rollout_time = time.perf_counter() - rollout_time
         cumulative_times["rollout_time"] += rollout_time
         # bootstrap value according to termination and truncation
         with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
-            advantages = torch.zeros_like(rewards).to(device)
-            lastgaelam = 0
-            for t in reversed(range(args.num_steps)):
-                if t == args.num_steps - 1:
-                    next_not_done = 1.0 - next_done
-                    nextvalues = next_value
-                else:
-                    next_not_done = 1.0 - dones[t + 1]
-                    nextvalues = values[t + 1]
-                real_next_values = next_not_done * nextvalues + final_values[t] # t instead of t+1
-                # next_not_done means nextvalues is computed from the correct next_obs
-                # if next_not_done is 1, final_values is always 0
-                # if next_not_done is 0, then use final_values, which is computed according to bootstrap_at_done
-                if args.finite_horizon_gae:
-                    """
-                    See GAE paper equation(16) line 1, we will compute the GAE based on this line only
-                    1             *(  -V(s_t)  + r_t                                                               + gamma * V(s_{t+1})   )
-                    lambda        *(  -V(s_t)  + r_t + gamma * r_{t+1}                                             + gamma^2 * V(s_{t+2}) )
-                    lambda^2      *(  -V(s_t)  + r_t + gamma * r_{t+1} + gamma^2 * r_{t+2}                         + ...                  )
-                    lambda^3      *(  -V(s_t)  + r_t + gamma * r_{t+1} + gamma^2 * r_{t+2} + gamma^3 * r_{t+3}
-                    We then normalize it by the sum of the lambda^i (instead of 1-lambda)
-                    """
-                    if t == args.num_steps - 1: # initialize
-                        lam_coef_sum = 0.
-                        reward_term_sum = 0. # the sum of the second term
-                        value_term_sum = 0. # the sum of the third term
-                    lam_coef_sum = lam_coef_sum * next_not_done
-                    reward_term_sum = reward_term_sum * next_not_done
-                    value_term_sum = value_term_sum * next_not_done
+            # Genetic Algorithm Step
+            agent.genetic_step(generation_fitness_scores)
+            if logger:
+                logger.add_scalar("charts/mean_fitness", generation_fitness_scores.mean().item(), global_step)
+                logger.add_scalar("charts/max_fitness", generation_fitness_scores.max().item(), global_step)
 
-                    lam_coef_sum = 1 + args.gae_lambda * lam_coef_sum
-                    reward_term_sum = args.gae_lambda * args.gamma * reward_term_sum + lam_coef_sum * rewards[t]
-                    value_term_sum = args.gae_lambda * args.gamma * value_term_sum + args.gamma * real_next_values
-
-                    advantages[t] = (reward_term_sum + value_term_sum) / lam_coef_sum - values[t]
-                else:
-                    delta = rewards[t] + args.gamma * real_next_values - values[t]
-                    advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * next_not_done * lastgaelam # Here actually we should use next_not_terminated, but we don't have lastgamlam if terminated
-            returns = advantages + values
-
-        # flatten the batch
-        b_obs = obs.reshape((-1,))
-        b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
-        b_advantages = advantages.reshape(-1)
-        b_returns = returns.reshape(-1)
-        b_values = values.reshape(-1)
+            # PPO Update using data from all latents
+            # Data is already in ppo_obs, ppo_actions, etc. (effectively b_obs, b_actions)
+            b_obs_ppo = ppo_obs # This is a DictArray
+            b_actions_ppo = ppo_actions
+            b_logprobs_ppo = ppo_logprobs
+            b_advantages_ppo = ppo_advantages
+            b_returns_ppo = ppo_returns
+            b_values_ppo = ppo_values
+            b_latent_ids_ppo = ppo_latent_ids
+            
 
         # Optimizing the policy and value network
         agent.train()
-        b_inds = np.arange(args.batch_size)
+        b_inds = np.arange(args.batch_size) # args.batch_size is total samples in this generation
         clipfracs = []
         update_time = time.perf_counter()
         for epoch in range(args.update_epochs):
@@ -524,9 +703,12 @@ def train(args: PPOArgs):
             for start in range(0, args.batch_size, args.minibatch_size):
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
-
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
-                logratio = newlogprob - b_logprobs[mb_inds]
+                # Construct minibatch obs for DictArray
+                mb_obs_data = {k: b_obs_ppo[k][mb_inds] for k in b_obs_ppo.keys()}
+                
+                _, newlogprob, entropy, newvalue = agent.get_action_and_value(
+                    mb_obs_data, latent_id=b_latent_ids_ppo[mb_inds], action=b_actions_ppo[mb_inds])
+                logratio = newlogprob - b_logprobs_ppo[mb_inds]
                 ratio = logratio.exp()
 
                 with torch.no_grad():
@@ -538,7 +720,7 @@ def train(args: PPOArgs):
                 if args.target_kl is not None and approx_kl > args.target_kl:
                     break
 
-                mb_advantages = b_advantages[mb_inds]
+                mb_advantages = b_advantages_ppo[mb_inds]
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
@@ -550,17 +732,17 @@ def train(args: PPOArgs):
                 # Value loss
                 newvalue = newvalue.view(-1)
                 if args.clip_vloss:
-                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
-                    v_clipped = b_values[mb_inds] + torch.clamp(
-                        newvalue - b_values[mb_inds],
+                    v_loss_unclipped = (newvalue - b_returns_ppo[mb_inds]) ** 2
+                    v_clipped = b_values_ppo[mb_inds] + torch.clamp(
+                        newvalue - b_values_ppo[mb_inds],
                         -args.clip_coef,
                         args.clip_coef,
                     )
-                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
+                    v_loss_clipped = (v_clipped - b_returns_ppo[mb_inds]) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
                     v_loss = 0.5 * v_loss_max.mean()
                 else:
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+                    v_loss = 0.5 * ((newvalue - b_returns_ppo[mb_inds]) ** 2).mean()
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
@@ -574,27 +756,31 @@ def train(args: PPOArgs):
                 break
         update_time = time.perf_counter() - update_time
         cumulative_times["update_time"] += update_time
-        y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
+        y_pred, y_true = b_values_ppo.cpu().numpy(), b_returns_ppo.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-        logger.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
-        logger.add_scalar("losses/value_loss", v_loss.item(), global_step)
-        logger.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
-        logger.add_scalar("losses/entropy", entropy_loss.item(), global_step)
-        logger.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
-        logger.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
-        logger.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
-        logger.add_scalar("losses/explained_variance", explained_var, global_step)
-        print("SPS:", int(global_step / (time.time() - start_time)))
-        logger.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
-        logger.add_scalar("time/step", global_step, global_step)
-        logger.add_scalar("time/update_time", update_time, global_step)
-        logger.add_scalar("time/rollout_time", rollout_time, global_step)
-        logger.add_scalar("time/rollout_fps", args.num_envs * args.num_steps / rollout_time, global_step)
-        for k, v in cumulative_times.items():
-            logger.add_scalar(f"time/total_{k}", v, global_step)
-        logger.add_scalar("time/total_rollout+update_time", cumulative_times["rollout_time"] + cumulative_times["update_time"], global_step)
+        if logger:
+            logger.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+            logger.add_scalar("losses/value_loss", v_loss.item(), global_step)
+            logger.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
+            logger.add_scalar("losses/entropy", entropy_loss.item(), global_step)
+            if old_approx_kl is not None : logger.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
+            if approx_kl is not None : logger.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
+            if clipfracs : logger.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
+            logger.add_scalar("losses/explained_variance", explained_var, global_step)
+            
+            total_generation_time = time.time() - generation_start_time
+            sps = int(env_steps_per_generation / total_generation_time)
+            print(f"SPS: {sps}")
+            logger.add_scalar("charts/SPS_generation", sps, global_step)
+            logger.add_scalar("time/generation_time", total_generation_time, global_step)
+            logger.add_scalar("time/update_time_per_gen", update_time, global_step)
+            logger.add_scalar("time/rollout_time_per_gen", rollout_time, global_step)
+            logger.add_scalar("time/rollout_fps_per_gen", env_steps_per_generation / rollout_time if rollout_time > 0 else 0, global_step)
+            for k_time, v_time in cumulative_times.items():
+                logger.add_scalar(f"time/total_{k_time}", v_time, global_step)
+                
     if args.save_model and not args.evaluate:
         model_path = f"runs/{run_name}/final_ckpt.pt"
         torch.save(agent.state_dict(), model_path)
