@@ -265,15 +265,8 @@ class EPOAgent(nn.Module):
 
         # Determine dim_state from feature_extractor output
         with torch.no_grad():
-            # Create a dummy batch of observations (use CPU for this temporary operation)
-            # Ensure dummy_obs structure matches what NatureCNN expects from sample_obs
-            dummy_obs_dict_cpu = {}
-            for k, v_tensor in sample_obs.items():
-                dummy_obs_dict_cpu[k] = torch.zeros((1,) + v_tensor.shape[1:], dtype=v_tensor.dtype, device="cpu")
-            
-            temp_feature_extractor = NatureCNN(sample_obs=dummy_obs_dict_cpu).to("cpu")
-            dummy_features = temp_feature_extractor(dummy_obs_dict_cpu)
-        dim_state = dummy_features.shape[1]
+            # The sample_obs is already a batched tensor on the correct device
+            dim_state = self.feature_extractor(sample_obs).shape[1]
 
         self.num_actions = np.prod(action_space_shape)
         self.actor_log_std = nn.Parameter(torch.zeros(1, self.num_actions, device=device))
@@ -297,21 +290,22 @@ class EPOAgent(nn.Module):
             dim_latent=args.dim_latent
         )
 
+    def _prepare_latents(self, features: torch.Tensor, latent_id: Union[int, torch.Tensor]) -> torch.Tensor:
+        """
+        Fetches latent vectors and expands them to match the batch size of features.
+        """
+        current_latents = self.latent_pool(latent_id=latent_id)
+        
+        # actor expects features: (B, D_state), latent_batch: (B, D_latent)
+        if features.ndim > 1: # Batched features
+            batch_size = features.shape[0]
+            if current_latents.ndim == 1 and batch_size > 1: # Single latent for a batch
+                return current_latents.unsqueeze(0).expand(batch_size, -1)
+        return current_latents
+
     def get_action(self, obs, latent_id: int, deterministic: bool = True):
         features = self.feature_extractor(obs)
-        # self.latent_pool is an nn.Parameter, so it's on the correct device via agent.to(device)
-        current_latents = self.latent_pool(latent_id=latent_id) 
-
-        # Expand latent to match batch size of features
-        # actor expects features: (B, D_state), latent_batch: (B, D_latent)
-        latent_batch = current_latents
-        if features.ndim > 0 and features.shape[0] > 0: # Should always be true for valid observation features
-            batch_size = features.shape[0] if features.ndim > 1 else 1
-            if current_latents.ndim == 1: # current_latents is (D_latent), features are batched
-                 latent_batch = current_latents.unsqueeze(0).expand(batch_size, -1)
-            # If current_latents is already batched (e.g. (B, D_latent)), use as is.
-            # This is unlikely from self.latent_pool(latent_id) which returns one latent.
-
+        latent_batch = self._prepare_latents(features, latent_id)
         action_mean = self.actor(features, latent_batch) # Assuming EPOActor returns only mean
         if deterministic:
             act = action_mean
@@ -324,14 +318,7 @@ class EPOAgent(nn.Module):
 
     def get_value(self, obs, latent_id: int):
         features = self.feature_extractor(obs)
-        current_latents = self.latent_pool(latent_id=latent_id)
-
-        latent_batch = current_latents
-        if features.ndim > 0 and features.shape[0] > 0:
-            batch_size = features.shape[0] if features.ndim > 1 else 1
-            if current_latents.ndim == 1: # current_latents is (D_latent), features are batched
-                 latent_batch = current_latents.unsqueeze(0).expand(batch_size, -1)
-
+        latent_batch = self._prepare_latents(features, latent_id)
         return self.critic(features, latent_batch)
 
     def genetic_step(self, fitness_scores: torch.Tensor):
@@ -339,14 +326,7 @@ class EPOAgent(nn.Module):
 
     def get_action_and_value(self, obs, latent_id: Union[int, torch.Tensor], action: Optional[torch.Tensor] = None):
         features = self.feature_extractor(obs)
-        current_latents = self.latent_pool(latent_id=latent_id) # Can be (D_latent) or (B, D_latent)
-
-        latent_batch = current_latents
-        if features.ndim > 0 and features.shape[0] > 0:
-            batch_size = features.shape[0] if features.ndim > 1 else 1
-            if current_latents.ndim == 1 and batch_size > 1 : # current_latents is (D_latent), features are (B, D_features)
-                 latent_batch = current_latents.unsqueeze(0).expand(batch_size, -1)
-        # If current_latents is (B, D_latent) and features is (B, D_features), latent_batch is already correct.
+        latent_batch = self._prepare_latents(features, latent_id)
 
         action_mean = self.actor(features, latent_batch) # Assuming EPOActor returns only mean
         action_log_std = self.actor_log_std.expand_as(action_mean)
@@ -595,8 +575,6 @@ def train(args: EPOArgs):
             latent_rewards_buffer = torch.zeros((args.num_steps_per_latent_eval, args.num_envs), device=device)
             latent_dones_buffer = torch.zeros((args.num_steps_per_latent_eval, args.num_envs), device=device)
             latent_values_buffer = torch.zeros((args.num_steps_per_latent_eval, args.num_envs), device=device)
-            # For GAE: V(s_T) if episode terminates at step t for an env
-            latent_final_values_for_gae = torch.zeros((args.num_steps_per_latent_eval, args.num_envs), device=device)
             
             current_latent_total_reward = 0.0
 
@@ -625,10 +603,7 @@ def train(args: EPOArgs):
                     
                     if "final_observation" in infos and done_mask.any():
                         final_obs_for_value = {k_obs: obs_val[done_mask] for k_obs, obs_val in infos["final_observation"].items() if obs_val is not None}
-                        if final_obs_for_value: # Ensure there's actual observation data
-                            with torch.no_grad():
-                                terminal_value = agent.get_value(final_obs_for_value, latent_id=latent_idx).view(-1)
-                                latent_final_values_for_gae[step, done_mask] = terminal_value
+                        # In standard GAE, the value of a terminal state is considered 0, so we don't need to do anything with final_observation's value.
                 
                 next_obs = obs_after_step
                 next_done = current_done_flags
@@ -649,10 +624,7 @@ def train(args: EPOArgs):
                         nextnonterminal = 1.0 - latent_dones_buffer[t + 1]
                         nextvalues_gae = latent_values_buffer[t + 1]
                     
-                    # If an episode terminated at step t, latent_final_values_for_gae[t] contains V(s_T)
-                    # Otherwise, it's zero.
-                    # delta incorporates V(s_T) if terminated, or gamma * V(s_{t+1}) if not.
-                    delta = latent_rewards_buffer[t] + args.gamma * (nextnonterminal * nextvalues_gae + latent_final_values_for_gae[t]) - latent_values_buffer[t]
+                    delta = latent_rewards_buffer[t] + args.gamma * nextvalues_gae * nextnonterminal - latent_values_buffer[t]
                     advantages_for_latent[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
                 returns_for_latent = advantages_for_latent + latent_values_buffer
 

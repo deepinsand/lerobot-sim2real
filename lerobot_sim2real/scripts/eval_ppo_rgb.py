@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import tyro
 from lerobot_sim2real.config.real_robot import create_real_robot
-from lerobot_sim2real.rl.ppo_rgb import Agent
+from lerobot_sim2real.rl.ppo_rgb import EPOAgent, EPOArgs
 
 from lerobot_sim2real.utils.safety import setup_safe_exit
 from mani_skill.agents.robots.lerobot.manipulator import LeRobotRealAgent
@@ -44,6 +44,24 @@ class Args:
     """Directory to save recordings of the camera captured images. If none no recordings are saved"""
     control_freq: Optional[int] = 15
     """The control frequency of the real robot. For safety reasons we recommend setting this to 15Hz or lower as we permit the RL agent to take larger actions to move faster. If this is none, it will use the same control frequency the sim env uses."""
+
+    # EPO model architecture arguments. These must match the parameters used for training.
+    include_state: bool = True
+    """whether to include low-dimensional state information in observations along with RGB"""
+    num_latents: int = 128
+    """Number of latent vectors (genes) in the population"""
+    dim_latent: int = 32
+    """Dimension of each latent vector"""
+    actor_mlp_depth: int = 2
+    """MLP depth for the EPO actor"""
+    critic_mlp_depth: int = 3
+    """MLP depth for the EPO critic"""
+    actor_dim: int = 256
+    """Hidden dimension for the EPO actor MLP"""
+    critic_dim: int = 256
+    """Hidden dimension for the EPO critic MLP"""
+    latent_id: int = 0
+    """The latent id to use for evaluation"""
 
 def overlay_envs(sim_env, real_env):
     """
@@ -94,7 +112,7 @@ def main(args: Args):
         **env_kwargs
     )
     # you can apply most wrappers freely to the sim_env and the real_env will use them as well
-    sim_env = FlattenRGBDObservationWrapper(sim_env)
+    sim_env = FlattenRGBDObservationWrapper(sim_env, rgb=True, depth=False, state=args.include_state)
     if args.record_dir is not None:
         # TODO (stao): verify this wrapper works
         sim_env = RecordEpisode(sim_env, output_dir=args.record_dir, save_trajectory=False, video_fps=sim_env.unwrapped.control_freq)
@@ -118,14 +136,32 @@ def main(args: Args):
 
     ### Load our checkpoint ###
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    agent = Agent(sim_env, sample_obs=real_obs)
+
+    # Create EPOArgs and populate it from the script's arguments.
+    # These need to match the arguments used during training.
+    epo_args = EPOArgs(
+        num_latents=args.num_latents,
+        dim_latent=args.dim_latent,
+        actor_mlp_depth=args.actor_mlp_depth,
+        critic_mlp_depth=args.critic_mlp_depth,
+        actor_dim=args.actor_dim,
+        critic_dim=args.critic_dim,
+        include_state=args.include_state,
+    )
+
+    agent = EPOAgent(
+        sample_obs=real_obs,
+        action_space_shape=real_env.action_space.shape,
+        args=epo_args,
+        device=device,
+    )
     if args.checkpoint:
         agent.load_state_dict(torch.load(args.checkpoint, map_location=device))
         print(f"Loaded agent from {args.checkpoint}")
     else:
         print("No checkpoint provided, using random agent")
     agent.to(device)
-
+    agent.eval()
     
     ### Visualization setup for debug modes ###
     if args.debug:
@@ -153,7 +189,8 @@ def main(args: Args):
             agent_obs = real_obs
 
             agent_obs = {k: v.to(device) for k, v in agent_obs.items()}
-            action = agent.get_action(agent_obs)
+            with torch.no_grad():
+                action = agent.get_action(agent_obs, latent_id=args.latent_id, deterministic=True)
             if not args.continuous_eval:
                 input("Press enter to continue to next timestep")
             real_obs, _, terminated, truncated, info = real_env.step(action.cpu().numpy())
