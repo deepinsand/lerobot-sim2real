@@ -261,7 +261,7 @@ class EPOAgent(nn.Module):
     def __init__(self, sample_obs, action_space_shape, args: EPOArgs, device):
         super().__init__()
         self.device = device
-        self.feature_extractor = NatureCNN(sample_obs=sample_obs)
+        self.feature_extractor = NatureCNN(sample_obs=sample_obs).to(device)
 
         # Determine dim_state from feature_extractor output
         with torch.no_grad():
