@@ -5,7 +5,7 @@ import json
 from typing import Optional
 import tyro
 
-from lerobot_sim2real.rl.ppo_rgb import EPOArgs, train
+from lerobot_sim2real.rl.epo_rgb import EPOArgs, train
 
 @dataclass
 class Args:

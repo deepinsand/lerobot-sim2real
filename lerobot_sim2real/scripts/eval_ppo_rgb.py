@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import tyro
 from lerobot_sim2real.config.real_robot import create_real_robot
-from lerobot_sim2real.rl.ppo_rgb import EPOAgent, EPOArgs
+from lerobot_sim2real.rl.epo_rgb import EPOAgent, EPOArgs
 
 from lerobot_sim2real.utils.safety import setup_safe_exit
 from mani_skill.agents.robots.lerobot.manipulator import LeRobotRealAgent
