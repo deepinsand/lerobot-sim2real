@@ -106,6 +106,14 @@ class EPOArgs:
     """Hidden dimension for the EPO actor MLP"""
     critic_dim: int = 256
     """Hidden dimension for the EPO critic MLP"""
+    frac_elitism: float = 0.1
+    """Fraction of the population to preserve from mutation (elitism)."""
+    frac_natural_selected: float = 0.25
+    """Fraction of the population to be replaced by offspring of the fittest individuals."""
+    mutation_strength: float = 1.0
+    """Standard deviation of the Gaussian noise added during mutation."""
+    apply_ga_every: int = 2
+    """Apply the genetic algorithm every N generations."""
 
     # PPO specific arguments
     learning_rate: float = 3e-4
@@ -160,6 +168,10 @@ class EPOAgent(nn.Module):
         self.latent_pool = LatentGenePool(
             num_latents=args.num_latents,
             dim_latent=args.dim_latent,
+            frac_elitism=args.frac_elitism,
+            frac_natural_selected=args.frac_natural_selected,
+            mutation_strength=args.mutation_strength,
+            apply_genetic_algorithm_every=args.apply_ga_every,
         )
         
         self.actor = BaseEPOActor(
