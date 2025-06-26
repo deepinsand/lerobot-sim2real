@@ -32,6 +32,13 @@ from evolutionary_policy_optimization import (
 import torch.optim as optim # Import optim
 
 
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    if isinstance(layer, nn.Linear):
+        torch.nn.init.orthogonal_(layer.weight, std)
+        torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
+
+
 @dataclass
 class EPOArgs:
     exp_name: Optional[str] = None
@@ -182,14 +189,14 @@ class EPOAgent(nn.Module):
             mlp_depth=args.actor_mlp_depth,
             num_actions=self.num_actions,
             dim_latent=args.dim_latent
-        )
+        ).apply(lambda m: layer_init(m, std=np.sqrt(2)))
         
         self.critic = BaseEPOCritic(
             dim_state=dim_state,
             dim=args.critic_dim,
             mlp_depth=args.critic_mlp_depth,
             dim_latent=args.dim_latent
-        )
+        ).apply(lambda m: layer_init(m, std=1))
 
     def _prepare_latents(self, features: torch.Tensor, latent_id: Union[int, torch.Tensor]) -> torch.Tensor:
         """
