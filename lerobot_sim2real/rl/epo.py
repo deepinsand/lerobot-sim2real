@@ -68,6 +68,8 @@ class EPOArgs:
     """extra environment kwargs to pass to the environment"""
     total_timesteps: int = 10000000
     """total timesteps of the experiments"""
+    num_envs_per_latent: int = 4
+    """the number of parallel environments each latent vector is evaluated on"""
     num_envs: int = 512
     """the number of parallel environments"""
     num_eval_envs: int = 8
@@ -270,14 +272,15 @@ class Logger:
 def train(args: EPOArgs):
     # Calculate number of generations based on total_timesteps
     # Each latent is evaluated for num_steps_per_latent_eval across num_envs
-    env_steps_per_generation = args.num_latents * args.num_envs * args.num_steps_per_latent_eval
+    args.num_envs = args.num_latents * args.num_envs_per_latent # Calculate total num_envs based on num_latents and num_envs_per_latent
+    env_steps_per_generation = args.num_envs * args.num_steps_per_latent_eval
     if env_steps_per_generation == 0 :
         raise ValueError("env_steps_per_generation is zero. Check num_latents, num_envs, or num_steps_per_latent_eval.")
     args.num_iterations = args.total_timesteps // env_steps_per_generation # num_iterations is num_generations
 
     # Calculate batch_size and minibatch_size for PPO
     # This batch_size is for the PPO update, accumulating data from all latents
-    args.batch_size = int(args.num_latents * args.num_envs * args.num_steps_per_latent_eval)
+    args.batch_size = int(args.num_envs * args.num_steps_per_latent_eval)
     if args.num_minibatches > 0:
         args.minibatch_size = int(args.batch_size // args.num_minibatches)
     else: 
@@ -372,10 +375,11 @@ def train(args: EPOArgs):
     # ALGO Logic: Storage setup
     # These buffers will store data for one full generation (all latents) for PPO update
     ppo_buffer_num_samples = args.num_latents * args.num_steps_per_latent_eval * args.num_envs
-    
+
     # Check if ppo_buffer_num_samples is zero before creating tensors
     if ppo_buffer_num_samples == 0:
-        raise ValueError("ppo_buffer_num_samples is zero. Check EPO args: num_latents, num_steps_per_latent_eval, num_envs.")
+        raise ValueError("ppo_buffer_num_samples is zero. Check EPO args: num_envs_per_latent, num_steps_per_latent_eval, num_latents.")
+
 
     ppo_obs = torch.zeros((ppo_buffer_num_samples,) + envs.single_observation_space.shape, device=device)
     ppo_actions = torch.zeros((ppo_buffer_num_samples,) + envs.single_action_space.shape, device=device)
@@ -390,7 +394,9 @@ def train(args: EPOArgs):
     start_time = time.time()
     next_obs, _ = envs.reset(seed=args.seed)
     eval_obs, _ = eval_envs.reset(seed=args.seed)
-    next_done = torch.zeros(args.num_envs, device=device)
+    next_done = torch.zeros(args.num_envs, device=device) # next_done for all num_envs
+    # Create a batch of latent IDs that repeats for each sub-environment
+    latent_id_batch = torch.arange(args.num_latents, device=device).repeat_interleave(args.num_envs_per_latent)
     print(f"####")
     print(f"Num Generations (args.num_iterations): {args.num_iterations}, Num Envs: {args.num_envs}, Num Eval Envs: {args.num_eval_envs}")
     print(f"PPO Batch Size (total samples per gen): {args.batch_size}, PPO Minibatch Size: {args.minibatch_size}, PPO Update Epochs: {args.update_epochs}")
@@ -416,11 +422,9 @@ def train(args: EPOArgs):
         if training_video_trigger:
             training_video_trigger.set_generation(generation)
         agent.eval()
-        # Variables for PPO data collection for the entire generation
-        current_ppo_buffer_idx = 0
-        generation_fitness_scores = torch.zeros(args.num_latents, device=device)
-
-        if generation % args.eval_freq == 0 or generation == 1: # Evaluate at start and then periodically
+        
+        # Evaluate at start and then periodically
+        if generation % args.eval_freq == 0 or generation == 1:
             print("Evaluating")
             stime = time.perf_counter()
             eval_obs, _ = eval_envs.reset()
@@ -457,99 +461,87 @@ def train(args: EPOArgs):
             frac = 1.0 - (generation - 1.0) / args.num_iterations
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
-        rollout_time = time.perf_counter()
+        rollout_time_start = time.perf_counter()
 
-        # Latent Evaluation Loop
-        for latent_idx in range(args.num_latents):
-            # Buffers for the current latent's rollout data
-            latent_obs_buffer = torch.zeros((args.num_steps_per_latent_eval, args.num_envs) + envs.single_observation_space.shape, device=device)
-            latent_actions_buffer = torch.zeros((args.num_steps_per_latent_eval, args.num_envs) + envs.single_action_space.shape, device=device)
-            latent_logprobs_buffer = torch.zeros((args.num_steps_per_latent_eval, args.num_envs), device=device)
-            latent_rewards_buffer = torch.zeros((args.num_steps_per_latent_eval, args.num_envs), device=device)
-            latent_dones_buffer = torch.zeros((args.num_steps_per_latent_eval, args.num_envs), device=device)
-            latent_values_buffer = torch.zeros((args.num_steps_per_latent_eval, args.num_envs), device=device)
-            
-            current_latent_total_reward = 0.0
+        # Buffers for the current generation's rollout data (all latents in parallel)
+        latent_obs_buffer = torch.zeros((args.num_steps_per_latent_eval, args.num_envs) + envs.single_observation_space.shape, device=device)
+        latent_actions_buffer = torch.zeros((args.num_steps_per_latent_eval, args.num_envs) + envs.single_action_space.shape, device=device)
+        latent_logprobs_buffer = torch.zeros((args.num_steps_per_latent_eval, args.num_envs), device=device)
+        latent_rewards_buffer = torch.zeros((args.num_steps_per_latent_eval, args.num_envs), device=device)
+        latent_dones_buffer = torch.zeros((args.num_steps_per_latent_eval, args.num_envs), device=device)
+        latent_values_buffer = torch.zeros((args.num_steps_per_latent_eval, args.num_envs), device=device)
+        
+        # Single Rollout Loop for all latents in parallel
+        for step in range(args.num_steps_per_latent_eval):
+            global_step += args.num_envs # Global step increments for each env step
+            latent_obs_buffer[step] = next_obs # next_obs is from previous step/latent
+            latent_dones_buffer[step] = next_done # next_done is from previous step/latent
 
-            for step in range(args.num_steps_per_latent_eval):
-                global_step += args.num_envs # Global step increments for each env step
-                latent_obs_buffer[step] = next_obs # next_obs is from previous step/latent
-                latent_dones_buffer[step] = next_done # next_done is from previous step/latent
-
-                with torch.no_grad():
-                    action, logprob, _, value = agent.get_action_and_value(next_obs, latent_id=latent_idx)
-                    latent_values_buffer[step] = value.flatten()
-                latent_actions_buffer[step] = action
-                latent_logprobs_buffer[step] = logprob
-
-                obs_after_step, reward, terminations, truncations, infos = envs.step(clip_action(action))
-                current_done_flags = torch.logical_or(terminations, truncations).to(torch.float32)
-                latent_rewards_buffer[step] = reward.view(-1) * args.reward_scale
-                current_latent_total_reward += latent_rewards_buffer[step].sum().item()
-
-                if "final_info" in infos and logger:
-                    final_info = infos["final_info"]
-                    done_mask = infos["_final_info"]
-                    for k_info, v_info in final_info["episode"].items():
-                        if done_mask.any():
-                            logger.add_scalar(f"train_latent_{latent_idx}/{k_info}", v_info[done_mask].float().mean(), global_step)
-                
-                next_obs = obs_after_step
-                next_done = current_done_flags
-
-            generation_fitness_scores[latent_idx] = current_latent_total_reward / (args.num_steps_per_latent_eval * args.num_envs) # Avg reward as fitness
-
-            # GAE Calculation for this latent's data
             with torch.no_grad():
-                # Value of the state after the last step of this latent's rollout
-                next_value_for_gae = agent.get_value(next_obs, latent_id=latent_idx).reshape(1, -1)
-                advantages_for_latent = torch.zeros_like(latent_rewards_buffer).to(device)
-                lastgaelam = 0
-                for t in reversed(range(args.num_steps_per_latent_eval)):
-                    if t == args.num_steps_per_latent_eval - 1:
-                        nextnonterminal = 1.0 - next_done # next_done is after this latent's last step
-                        nextvalues_gae = next_value_for_gae
-                    else:
-                        nextnonterminal = 1.0 - latent_dones_buffer[t + 1]
-                        nextvalues_gae = latent_values_buffer[t + 1]
-                    
-                    delta = latent_rewards_buffer[t] + args.gamma * nextvalues_gae * nextnonterminal - latent_values_buffer[t]
-                    advantages_for_latent[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-                returns_for_latent = advantages_for_latent + latent_values_buffer
+                # Pass the batch of latent IDs to get_action_and_value
+                action, logprob, _, value = agent.get_action_and_value(next_obs, latent_id=latent_id_batch)
+                latent_values_buffer[step] = value.flatten()
+            latent_actions_buffer[step] = action
+            latent_logprobs_buffer[step] = logprob
 
-            # Store this latent's data into the generation-wide PPO buffers
-            start_idx = current_ppo_buffer_idx
-            end_idx = start_idx + args.num_steps_per_latent_eval * args.num_envs
+            obs_after_step, reward, terminations, truncations, infos = envs.step(clip_action(action))
+            current_done_flags = torch.logical_or(terminations, truncations).to(torch.float32)
+            latent_rewards_buffer[step] = reward.view(-1) * args.reward_scale
             
-            ppo_obs[start_idx:end_idx] = latent_obs_buffer.reshape((-1,) + envs.single_observation_space.shape)
-            ppo_actions[start_idx:end_idx] = latent_actions_buffer.reshape((-1,) + envs.single_action_space.shape)
-            ppo_logprobs[start_idx:end_idx] = latent_logprobs_buffer.reshape(-1)
-            ppo_advantages[start_idx:end_idx] = advantages_for_latent.reshape(-1)
-            ppo_returns[start_idx:end_idx] = returns_for_latent.reshape(-1)
-            ppo_values[start_idx:end_idx] = latent_values_buffer.reshape(-1)
-            ppo_latent_ids[start_idx:end_idx] = torch.full(((args.num_steps_per_latent_eval * args.num_envs),), latent_idx, device=device, dtype=torch.long)
-            current_ppo_buffer_idx = end_idx
+            # Logging for individual episodes (if any)
+            if "final_info" in infos and logger:
+                final_info = infos["final_info"]
+                done_mask = infos["_final_info"]
+                # Removed per-latent logging during rollout for simplicity,
+                # as it's harder to manage with batched latent_ids.
+                # Overall fitness will be logged later.
+            
+            next_obs = obs_after_step
+            next_done = current_done_flags
 
-        rollout_time = time.perf_counter() - rollout_time
+        rollout_time = time.perf_counter() - rollout_time_start
         cumulative_times["rollout_time"] += rollout_time
         # bootstrap value according to termination and truncation
         with torch.no_grad():
-            # Genetic Algorithm Step
+            # Value of the state after the last step of this rollout
+            next_value_for_gae = agent.get_value(next_obs, latent_id=latent_id_batch).reshape(1, -1)
+            advantages_for_latent = torch.zeros_like(latent_rewards_buffer).to(device)
+            lastgaelam = torch.zeros(args.num_envs, device=device) # lastgaelam needs to be per-environment
+            for t in reversed(range(args.num_steps_per_latent_eval)):
+                if t == args.num_steps_per_latent_eval - 1:
+                    nextnonterminal = 1.0 - next_done # next_done is after this rollout's last step
+                    nextvalues_gae = next_value_for_gae.flatten() # Flatten for element-wise ops
+                else:
+                    nextnonterminal = 1.0 - latent_dones_buffer[t + 1]
+                    nextvalues_gae = latent_values_buffer[t + 1]
+                
+                delta = latent_rewards_buffer[t] + args.gamma * nextvalues_gae * nextnonterminal - latent_values_buffer[t]
+                advantages_for_latent[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+            returns_for_latent = advantages_for_latent + latent_values_buffer
+
+            # Calculate generation fitness scores (average reward per latent)
+            total_rewards_per_env = latent_rewards_buffer.sum(dim=0) # Sum rewards over steps for each environment
+            generation_fitness_scores = torch.zeros(args.num_latents, device=device)
+            # Use scatter_add to sum rewards for each latent ID
+            generation_fitness_scores.scatter_add_(0, latent_id_batch, total_rewards_per_env)
+            # Divide by the number of environments per latent to get the average fitness
+            generation_fitness_scores /= args.num_envs_per_latent
+
+            # Genetic Algorithm Step (uses the calculated generation_fitness_scores)
             agent.genetic_step(generation_fitness_scores)
             if logger:
                 logger.add_scalar("charts/mean_fitness", generation_fitness_scores.mean().item(), global_step)
                 logger.add_scalar("charts/max_fitness", generation_fitness_scores.max().item(), global_step)
 
             # PPO Update using data from all latents
-            # Data is already in ppo_obs, ppo_actions, etc. (effectively b_obs, b_actions)
-            b_obs_ppo = ppo_obs
-            b_actions_ppo = ppo_actions
-            b_logprobs_ppo = ppo_logprobs
-            b_advantages_ppo = ppo_advantages
-            b_returns_ppo = ppo_returns
-            b_values_ppo = ppo_values
-            b_latent_ids_ppo = ppo_latent_ids
-            
+            # Store this generation's data into the generation-wide PPO buffers
+            b_obs_ppo = latent_obs_buffer.reshape((-1,) + envs.single_observation_space.shape)
+            b_actions_ppo = latent_actions_buffer.reshape((-1,) + envs.single_action_space.shape)
+            b_logprobs_ppo = latent_logprobs_buffer.reshape(-1)
+            b_advantages_ppo = advantages_for_latent.reshape(-1)
+            b_returns_ppo = returns_for_latent.reshape(-1)
+            b_values_ppo = latent_values_buffer.reshape(-1)
+            b_latent_ids_ppo = latent_id_batch.repeat(args.num_steps_per_latent_eval)
 
         # Optimizing the policy and value network
         agent.train()
